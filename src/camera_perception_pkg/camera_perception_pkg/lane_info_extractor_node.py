@@ -24,6 +24,11 @@ TARGET_BAND_THICKNESS = 12
 MIN_VALID_WIDTH = 60
 SMOOTHING_ALPHA = 0.35
 MAX_TARGET_STEP_PX = 20.0
+
+# lane2가 잠깐 사라질 때 즉시 멈추지 않고 마지막 유효 경로를 잠시 유지한다.
+# 20~25 Hz 기준 약 0.3~0.4초. 이보다 오래 사라지면 publish를 멈춰
+# motion_planner의 path timeout이 차량을 정지시키도록 한다.
+MAX_LANE_DROPOUT_FRAMES = 8
 #----------------------------------------------
 
 
@@ -39,9 +44,16 @@ class Yolov8InfoExtractor(Node):
             self.declare_parameter('smoothing_alpha', SMOOTHING_ALPHA).value)
         self.max_target_step_px = float(
             self.declare_parameter('max_target_step_px', MAX_TARGET_STEP_PX).value)
+        self.max_lane_dropout_frames = int(
+            self.declare_parameter(
+                'max_lane_dropout_frames', MAX_LANE_DROPOUT_FRAMES
+            ).value
+        )
 
         self.cv_bridge = CvBridge()
         self.prev_target_x = [None] * len(TARGET_Y_VALUES)
+        self.last_valid_grad = 0.0
+        self.lane_dropout_count = 0
 
         self.qos_profile = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
@@ -127,14 +139,62 @@ class Yolov8InfoExtractor(Node):
         self.prev_target_x[target_idx] = target_x
         return target_x
 
+    def publish_lane(self, target_x_values, grad):
+        lane = LaneInfo()
+        lane.slope = float(grad)
+
+        target_points = []
+        for target_x, target_y in zip(target_x_values, TARGET_Y_VALUES):
+            target_point = TargetPoint()
+            target_point.target_x = int(round(target_x))
+            target_point.target_y = int(target_y)
+            target_points.append(target_point)
+
+        lane.target_points = target_points
+        self.publisher.publish(lane)
+        return target_points
+
+    def handle_lane_dropout(self):
+        """짧은 lane2 dropout 동안 마지막 유효 target을 유지하고, 길어지면 fail-safe에 맡긴다."""
+        self.lane_dropout_count += 1
+
+        # OpenCV 창이 lane2 dropout 중에도 event loop를 처리하도록 한다.
+        if self.show_image:
+            cv2.waitKey(1)
+
+        have_previous_target = all(x is not None for x in self.prev_target_x)
+
+        if (
+            have_previous_target
+            and self.lane_dropout_count <= self.max_lane_dropout_frames
+        ):
+            self.publish_lane(self.prev_target_x, self.last_valid_grad)
+            self.get_logger().warning(
+                f"No valid '{self.lane_class_name}' mask: holding last path "
+                f"({self.lane_dropout_count}/{self.max_lane_dropout_frames})"
+            )
+            return
+
+        self.get_logger().warning(
+            f"No valid '{self.lane_class_name}' mask: dropout "
+            f"{self.lane_dropout_count} frames, stop publishing lane path"
+        )
+
     def yolov8_detections_callback(self, detection_msg: DetectionArray):
         if len(detection_msg.detections) == 0:
+            self.handle_lane_dropout()
             return
 
         lane2_mask_image = self.build_lane_mask(detection_msg)
         if lane2_mask_image is None or cv2.countNonZero(lane2_mask_image) == 0:
-            self.get_logger().warning(f"No valid '{self.lane_class_name}' mask detected")
+            self.handle_lane_dropout()
             return
+
+        if self.lane_dropout_count > 0:
+            self.get_logger().info(
+                f"lane2 recovered after {self.lane_dropout_count} dropout frames"
+            )
+        self.lane_dropout_count = 0
 
         h, w = lane2_mask_image.shape[:2]
         dst_mat = [
@@ -151,23 +211,20 @@ class Yolov8InfoExtractor(Node):
             lane2_bird_image, cutting_idx=300)
         roi_image = cv2.convertScaleAbs(roi_image)
 
-        target_points = []
         target_x_values = []
 
         for idx, target_point_y in enumerate(TARGET_Y_VALUES):
             target_point_x = self.estimate_target_x(
                 roi_image, target_point_y, idx)
-
-            target_point = TargetPoint()
-            target_point.target_x = int(round(target_point_x))
-            target_point.target_y = int(target_point_y)
-            target_points.append(target_point)
             target_x_values.append(target_point_x)
 
         # 메시지 slope는 디버깅용. 실제 steering은 path를 이용한다.
         dx = target_x_values[-1] - target_x_values[0]
         dy = TARGET_Y_VALUES[-1] - TARGET_Y_VALUES[0]
         grad = float(np.degrees(np.arctan(dx / dy))) if dy != 0 else 0.0
+        self.last_valid_grad = grad
+
+        target_points = self.publish_lane(target_x_values, grad)
 
         debug_roi = cv2.cvtColor(roi_image, cv2.COLOR_GRAY2BGR)
         for point in target_points:
@@ -199,11 +256,6 @@ class Yolov8InfoExtractor(Node):
         except Exception as e:
             self.get_logger().error(
                 f"Failed to convert and publish ROI image: {e}")
-
-        lane = LaneInfo()
-        lane.slope = grad
-        lane.target_points = target_points
-        self.publisher.publish(lane)
 
         self.get_logger().info(
             "target_x=" + ", ".join(f"{x:.1f}" for x in target_x_values) +
