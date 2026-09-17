@@ -19,7 +19,10 @@ SHOW_IMAGE = True
 LANE_CLASS_NAME = "lane2"
 STOP_ZONE_CLASS_NAME = "stop_zone"
 BOUNDARY_CLASS_NAMES = ("dashed_line", "solid_line")
-TARGET_Y_VALUES = (30, 70, 110)
+
+# 곡선의 중앙선을 3개 점으로만 근사하면 path가 chord처럼 코너를 잘라간다.
+# ROI(약 180 px)에서 20 px 간격으로 중심점을 뽑아 실제 곡률을 더 잘 보존한다.
+TARGET_Y_VALUES = (20, 40, 60, 80, 100, 120, 140)
 TARGET_BAND_THICKNESS = 12
 MIN_VALID_WIDTH = 40
 MIN_CORRIDOR_WIDTH = 70
