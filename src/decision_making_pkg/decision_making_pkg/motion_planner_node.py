@@ -336,7 +336,6 @@ class MotionPlanningNode(Node):
                 self.set_state("GO")
                 target_slope, raw_steering = self.set_lane_following_command()
             elif zone_ymax is None:
-                # Red만 있고 stop_zone 근거가 사라졌다면 정지 조건이 더 이상 성립하지 않는다.
                 self.set_state("CRUISE")
                 target_slope, raw_steering = self.set_lane_following_command()
             elif zone_ymax >= self.stop_zone_stop_y:
@@ -348,8 +347,6 @@ class MotionPlanningNode(Node):
                 )
 
         elif self.drive_state == "STOPPED_RED":
-            # 멈춘 뒤에는 일시적인 detection dropout으로 다시 출발하지 않는다.
-            # Green이 연속으로 확인될 때만 출발한다.
             if green_confirmed:
                 self.set_state("GO")
                 target_slope, raw_steering = self.set_lane_following_command()
@@ -357,7 +354,6 @@ class MotionPlanningNode(Node):
                 self.stop_vehicle()
 
         elif self.drive_state == "GO":
-            # 출발 직후 같은 stop_zone을 다시 잡아 재정지하는 것을 막는다.
             target_slope, raw_steering = self.set_lane_following_command()
             if self.go_clear_elapsed():
                 self.set_state("CRUISE")
@@ -366,13 +362,7 @@ class MotionPlanningNode(Node):
             self.set_state("CRUISE")
             target_slope, raw_steering = self.set_lane_following_command()
 
-        return (
-            target_slope,
-            raw_steering,
-            zone_ymax,
-            red_confirmed,
-            green_confirmed
-        )
+        return target_slope, raw_steering, zone_ymax, red_confirmed, green_confirmed
 
     def timer_callback(self):
         target_slope = 0.0
