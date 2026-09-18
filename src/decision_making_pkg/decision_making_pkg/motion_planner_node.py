@@ -23,53 +23,51 @@ CAR_CENTER_X = 320.0
 # ------------------------------------------------------------
 # Curve state machine
 #
-# STRAIGHT -> TURN_IN -> HOLD -> EXIT -> STRAIGHT
+# 핵심 수정:
+#   "path heading이 기울어져 있다" != "도로가 곡선이다"
 #
-# 매 프레임 즉시 steering을 크게 바꾸는 대신,
-# 1) 코너를 미리 확인하고
-# 2) TURN_IN에서 천천히 조향을 만들고
-# 3) HOLD에서 거의 일정한 조향을 유지하고
-# 4) EXIT에서 천천히 핸들을 푼다.
+# 이전 버전은 far/near heading의 절대값이 크면 곡선으로 판단했기 때문에,
+# 차량이 직선 차선에 비스듬히 놓인 경우에도 TURN_IN에 들어갈 수 있었다.
+#
+# 이제 곡선 여부는 far tangent와 near tangent의 차이,
+# 즉 curvature proxy = far_heading - near_heading 으로 판단한다.
 # ------------------------------------------------------------
-CURVE_ENTER_DEG = 4.0
-CURVE_EXIT_DEG = 2.0
+CURVATURE_ENTER_DEG = 5.0
+CURVATURE_EXIT_DEG = 2.0
+CURVATURE_OPPOSITE_EXIT_DEG = 3.0
 CURVE_CONFIRM_FRAMES = 3
 CURVE_EXIT_CONFIRM_FRAMES = 3
-HOLD_MIN_SEC = 0.45
-TURN_IN_MAX_SEC = 1.4
+HOLD_MIN_SEC = 0.40
+TURN_IN_MAX_SEC = 1.50
 
-# path에서 가까운/먼 tangent를 각각 계산한다.
+# 100-point path 기준 near/far sampling.
 NEAR_TRACK_FROM_END = 12
 NEAR_TANGENT_SPAN = 10
 FAR_TRACK_FROM_END = 45
 FAR_TANGENT_SPAN = 12
 
-# steering command는 int32이므로 내부에서는 float으로 천천히 움직인 뒤 round한다.
-TURN_IN_RAMP_PER_TICK = 0.30
-HOLD_ADJUST_PER_TICK = 0.20
-EXIT_RAMP_PER_TICK = 0.45
-STRAIGHT_RAMP_PER_TICK = 0.25
+# 내부 float steering ramp.
+# TURN_IN은 의도적으로 천천히, EXIT은 그보다 조금 빠르게 푼다.
+TURN_IN_RAMP_PER_TICK = 0.20
+HOLD_ADJUST_PER_TICK = 0.15
+EXIT_RAMP_PER_TICK = 0.30
+STRAIGHT_RAMP_PER_TICK = 0.15
 
-# 직선 구간에서는 작은 보정만 허용한다.
-KP_STRAIGHT_HEADING = 0.07
-KP_STRAIGHT_LATERAL = 0.018
+# 직선에서는 현재 heading/lateral error만 작은 범위에서 보정.
+KP_STRAIGHT_HEADING = 0.08
+KP_STRAIGHT_LATERAL = 0.015
 STRAIGHT_STEERING_LIMIT = 2.0
 
-# HOLD에서는 기본 turn steering을 거의 유지하고, lateral error만 약하게 보정한다.
-KP_HOLD_LATERAL = 0.015
-HOLD_CORRECTION_LIMIT = 0.70
+# HOLD에서는 기본 조향을 유지하고 lateral error만 미세 보정.
+KP_HOLD_LATERAL = 0.012
+HOLD_CORRECTION_LIMIT = 0.50
 
-# 코너 안쪽을 자르는 것을 줄이기 위해 center path를 약간 바깥쪽으로 bias한다.
-OUTSIDE_OFFSET_SHALLOW_PX = 8.0
-OUTSIDE_OFFSET_MEDIUM_PX = 14.0
-OUTSIDE_OFFSET_SHARP_PX = 20.0
-
-# Curve-aware speed
+# Speed
 DRIVING_SPEED = 60
-SHALLOW_CURVE_SPEED = 50
-MEDIUM_CURVE_SPEED = 42
-SHARP_CURVE_SPEED = 34
-EXIT_SPEED = 42
+SHALLOW_CURVE_SPEED = 48
+MEDIUM_CURVE_SPEED = 40
+SHARP_CURVE_SPEED = 32
+EXIT_SPEED = 40
 APPROACH_SPEED = 35
 
 PATH_TIMEOUT_SEC = 0.5
@@ -135,28 +133,25 @@ class MotionPlanningNode(Node):
         self.steering_command = 0
         self.left_speed_command = 0
         self.right_speed_command = 0
-
-        # 실제 actuator에 보내기 전 내부 float steering.
         self.filtered_steering = 0.0
 
-        # Curve state machine state.
+        # Curve state
         self.curve_state = "STRAIGHT"
-        self.curve_direction = 0   # left=-1, right=+1
+        self.curve_direction = 0
         self.curve_entry_count = 0
         self.curve_exit_count = 0
         self.curve_state_start_ns = self.now_ns()
         self.turn_target_steering = 0.0
 
-        # Debug values.
+        # Debug
         self.last_near_heading = 0.0
         self.last_far_heading = 0.0
+        self.last_curvature = 0.0
         self.last_lateral_error = 0.0
-        self.last_outside_offset = 0.0
         self.last_curve_speed = self.driving_speed
         self.last_turn_target = 0.0
 
-        # Traffic state machine.
-        # CRUISE -> APPROACH_RED -> STOPPED_RED -> GO -> CRUISE
+        # Traffic state
         self.drive_state = "CRUISE"
         self.go_start_time_ns = None
 
@@ -329,9 +324,18 @@ class MotionPlanningNode(Node):
             far_point
         )
 
+        # 직선이 카메라에 비스듬히 보이면 near/far heading 모두 클 수 있지만
+        # 둘의 차이는 작다. 곡선에서는 앞/뒤 tangent가 달라진다.
+        curvature = far_heading - near_heading
+
         lateral_error = float(near_point[0] - CAR_CENTER_X)
 
-        return near_heading, far_heading, lateral_error
+        return (
+            near_heading,
+            far_heading,
+            curvature,
+            lateral_error
+        )
 
     @staticmethod
     def sign(value):
@@ -350,26 +354,16 @@ class MotionPlanningNode(Node):
         return current
 
     @staticmethod
-    def steering_target_magnitude(severity_deg):
-        severity = abs(severity_deg)
+    def steering_target_magnitude(curvature_deg):
+        severity = abs(curvature_deg)
 
-        if severity < 8.0:
+        if severity < 9.0:
             return 2.0
-        if severity < 15.0:
+        if severity < 16.0:
             return 3.0
-        if severity < 24.0:
+        if severity < 25.0:
             return 4.0
         return 5.0
-
-    @staticmethod
-    def outside_offset_magnitude(severity_deg):
-        severity = abs(severity_deg)
-
-        if severity < 8.0:
-            return OUTSIDE_OFFSET_SHALLOW_PX
-        if severity < 15.0:
-            return OUTSIDE_OFFSET_MEDIUM_PX
-        return OUTSIDE_OFFSET_SHARP_PX
 
     @staticmethod
     def curve_speed_from_target(target_magnitude):
@@ -407,29 +401,28 @@ class MotionPlanningNode(Node):
         self.turn_target_steering = 0.0
         self.filtered_steering = 0.0
 
-    def update_curve_state(self, near_heading, far_heading):
-        # 코너 진입은 먼 path를 먼저 본다.
-        entry_heading = (
-            far_heading
-            if abs(far_heading) >= abs(near_heading)
-            else near_heading
-        )
-        entry_direction = self.sign(entry_heading)
-        entry_strength = abs(entry_heading)
+    def update_curve_state(
+        self,
+        near_heading,
+        far_heading,
+        curvature
+    ):
+        curve_direction = self.sign(curvature)
+        curve_strength = abs(curvature)
 
         if self.curve_state == "STRAIGHT":
             if (
-                entry_direction != 0
-                and entry_strength >= CURVE_ENTER_DEG
+                curve_direction != 0
+                and curve_strength >= CURVATURE_ENTER_DEG
             ):
                 self.curve_entry_count += 1
             else:
                 self.curve_entry_count = 0
 
             if self.curve_entry_count >= CURVE_CONFIRM_FRAMES:
-                self.curve_direction = entry_direction
+                self.curve_direction = curve_direction
                 magnitude = self.steering_target_magnitude(
-                    entry_strength
+                    curve_strength
                 )
                 self.turn_target_steering = (
                     self.curve_direction * magnitude
@@ -437,15 +430,11 @@ class MotionPlanningNode(Node):
                 self.set_curve_state("TURN_IN")
 
         elif self.curve_state == "TURN_IN":
-            # 같은 방향의 코너가 더 급해지면 목표 조향은 증가시킬 수 있다.
-            same_direction_strengths = [
-                abs(h)
-                for h in (near_heading, far_heading)
-                if self.sign(h) == self.curve_direction
-            ]
-            if same_direction_strengths:
-                severity = max(same_direction_strengths)
-                new_mag = self.steering_target_magnitude(severity)
+            # 같은 방향으로 곡률이 더 커지면 target만 한 단계 높일 수 있다.
+            if curve_direction == self.curve_direction:
+                new_mag = self.steering_target_magnitude(
+                    curve_strength
+                )
                 if new_mag > abs(self.turn_target_steering):
                     self.turn_target_steering = (
                         self.curve_direction * new_mag
@@ -455,7 +444,7 @@ class MotionPlanningNode(Node):
                 abs(
                     self.filtered_steering
                     - self.turn_target_steering
-                ) <= 0.35
+                ) <= 0.30
             )
             timed_out = (
                 self.elapsed_sec(self.curve_state_start_ns)
@@ -470,16 +459,17 @@ class MotionPlanningNode(Node):
                 self.curve_exit_count = 0
                 return
 
-            # 1) 가까운 path가 거의 펴졌거나
-            # 2) 먼 path에서 반대 방향 S-curve가 보이면
-            # 핸들을 풀기 시작한다.
-            near_is_straight = abs(near_heading) <= CURVE_EXIT_DEG
-            far_is_opposite = (
-                self.sign(far_heading) == -self.curve_direction
-                and abs(far_heading) >= CURVE_ENTER_DEG
+            # 현재 코너의 곡률이 사라졌거나,
+            # S-curve처럼 반대 방향 곡률이 나타나면 EXIT.
+            curve_is_flat = (
+                curve_strength <= CURVATURE_EXIT_DEG
+            )
+            curve_is_opposite = (
+                curve_direction == -self.curve_direction
+                and curve_strength >= CURVATURE_OPPOSITE_EXIT_DEG
             )
 
-            if near_is_straight or far_is_opposite:
+            if curve_is_flat or curve_is_opposite:
                 self.curve_exit_count += 1
             else:
                 self.curve_exit_count = 0
@@ -488,27 +478,20 @@ class MotionPlanningNode(Node):
                 self.set_curve_state("EXIT")
 
         elif self.curve_state == "EXIT":
-            if abs(self.filtered_steering) <= 0.35:
+            if abs(self.filtered_steering) <= 0.25:
                 self.filtered_steering = 0.0
 
-                # S-curve이면 곧바로 다음 방향 TURN_IN 준비.
-                next_heading = (
-                    far_heading
-                    if abs(far_heading) >= abs(near_heading)
-                    else near_heading
-                )
-                next_direction = self.sign(next_heading)
-
+                # S-curve이면 현재 curvature의 방향으로 다음 TURN_IN.
                 if (
-                    next_direction != 0
-                    and abs(next_heading) >= CURVE_ENTER_DEG
+                    curve_direction != 0
+                    and curve_strength >= CURVATURE_ENTER_DEG
                 ):
-                    self.curve_direction = next_direction
+                    self.curve_direction = curve_direction
                     magnitude = self.steering_target_magnitude(
-                        abs(next_heading)
+                        curve_strength
                     )
                     self.turn_target_steering = (
-                        next_direction * magnitude
+                        self.curve_direction * magnitude
                     )
                     self.set_curve_state("TURN_IN")
                 else:
@@ -519,28 +502,22 @@ class MotionPlanningNode(Node):
         if geometry is None:
             return None
 
-        near_heading, far_heading, lateral_error = geometry
+        (
+            near_heading,
+            far_heading,
+            curvature,
+            lateral_error
+        ) = geometry
 
         self.update_curve_state(
             near_heading,
-            far_heading
+            far_heading,
+            curvature
         )
-
-        severity = max(
-            abs(near_heading),
-            abs(far_heading)
-        )
-
-        outside_offset = 0.0
-        if self.curve_direction != 0:
-            outside_offset = (
-                -self.curve_direction
-                * self.outside_offset_magnitude(severity)
-            )
-
-        adjusted_lateral = lateral_error + outside_offset
 
         if self.curve_state == "STRAIGHT":
+            # 직선에서 heading이 약간 기울어진 것은 곡선으로 보지 않는다.
+            # 작은 P-control로 차선 중앙/방향만 맞춘다.
             raw_target = (
                 KP_STRAIGHT_HEADING * near_heading
                 + KP_STRAIGHT_LATERAL * lateral_error
@@ -558,12 +535,12 @@ class MotionPlanningNode(Node):
             speed = self.driving_speed
 
         elif self.curve_state == "TURN_IN":
-            # 코너 진입에서는 목표 steering까지 천천히 만든다.
+            # 목표 조향까지 매우 천천히 만든다.
             correction = max(
-                -0.45,
+                -0.35,
                 min(
-                    0.45,
-                    KP_HOLD_LATERAL * adjusted_lateral
+                    0.35,
+                    KP_HOLD_LATERAL * lateral_error
                 )
             )
             target = (
@@ -581,12 +558,11 @@ class MotionPlanningNode(Node):
 
         elif self.curve_state == "HOLD":
             # 코너 중간에서는 steering을 거의 고정한다.
-            # center path보다 바깥쪽으로 약간 bias해서 안쪽 cutting을 줄인다.
             correction = max(
                 -HOLD_CORRECTION_LIMIT,
                 min(
                     HOLD_CORRECTION_LIMIT,
-                    KP_HOLD_LATERAL * adjusted_lateral
+                    KP_HOLD_LATERAL * lateral_error
                 )
             )
             target = (
@@ -619,17 +595,16 @@ class MotionPlanningNode(Node):
 
         self.last_near_heading = near_heading
         self.last_far_heading = far_heading
+        self.last_curvature = curvature
         self.last_lateral_error = lateral_error
-        self.last_outside_offset = outside_offset
         self.last_curve_speed = speed
         self.last_turn_target = self.turn_target_steering
 
         return (
             command,
             near_heading,
-            far_heading,
+            curvature,
             lateral_error,
-            outside_offset,
             speed
         )
 
@@ -649,9 +624,8 @@ class MotionPlanningNode(Node):
         (
             command,
             near_heading,
-            far_heading,
+            curvature,
             lateral_error,
-            outside_offset,
             curve_speed
         ) = result
 
@@ -800,8 +774,8 @@ class MotionPlanningNode(Node):
             f"red={red_confirmed}, green={green_confirmed}, "
             f"near={self.last_near_heading:.2f}, "
             f"far={self.last_far_heading:.2f}, "
+            f"curvature={self.last_curvature:.2f}, "
             f"lateral={self.last_lateral_error:.1f}px, "
-            f"outside={self.last_outside_offset:.1f}px, "
             f"turn_target={self.last_turn_target:.2f}, "
             f"steering_float={self.filtered_steering:.2f}, "
             f"steering={self.steering_command}, "
