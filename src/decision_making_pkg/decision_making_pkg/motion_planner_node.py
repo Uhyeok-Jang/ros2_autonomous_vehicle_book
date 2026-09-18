@@ -17,26 +17,28 @@ SUB_LIDAR_OBSTACLE_TOPIC_NAME = "lidar_obstacle_info"
 PUB_TOPIC_NAME = "topic_control_signal"
 
 TIMER = 0.1
-MAX_STEERING = 7.0
+MAX_STEERING = 6.0
 CAR_CENTER_X = 320.0
 
 # Curve tracking controller
 # 기존에는 차량 중심 -> 먼 lookahead 점의 기울기만 사용해서 코너를 안쪽으로 자르는
 # 경향이 있었다. 이제 가까운 구간의 path tangent + lateral error를 함께 사용한다.
-KP_HEADING = 0.12
+KP_HEADING = 0.13
 KP_LATERAL = 0.035
 STEERING_DEADBAND_DEG = 1.0
 STEERING_ALPHA = 0.30
 STEERING_STEP_TURN_IN = 0.8
 STEERING_STEP_RECOVER = 1.4
-TRACKING_FROM_END = 20
-TANGENT_SPAN = 12
+# 값이 작을수록 차량에 가까운 경로만 사용하므로 코너 선행 조향이 줄어든다.
+TRACKING_FROM_END = 8
+TANGENT_SPAN = 5
+STEERING_DELAY_SEC = 2.0
 
 # Curve-aware speed
-DRIVING_SPEED = 60
-MEDIUM_CURVE_SPEED = 48
-SHARP_CURVE_SPEED = 38
-APPROACH_SPEED = 35
+DRIVING_SPEED = 65
+MEDIUM_CURVE_SPEED = 60
+SHARP_CURVE_SPEED = 55
+APPROACH_SPEED = 55
 MEDIUM_CURVE_DEG = 8.0
 SHARP_CURVE_DEG = 18.0
 LATERAL_MEDIUM_PX = 28.0
@@ -90,6 +92,11 @@ class MotionPlanningNode(Node):
         )
         self.tangent_span = int(
             self.declare_parameter('tangent_span', TANGENT_SPAN).value)
+        self.steering_delay_sec = float(
+            self.declare_parameter(
+                'steering_delay_sec', STEERING_DELAY_SEC
+            ).value
+        )
 
         self.driving_speed = int(
             self.declare_parameter('driving_speed', DRIVING_SPEED).value)
@@ -145,6 +152,8 @@ class MotionPlanningNode(Node):
         self.last_lateral_error = 0.0
         self.last_curve_speed = self.driving_speed
         self.last_step_limit = self.steering_step_turn_in
+        self.curve_entry_time_ns = None
+        self.last_steering_delay_remaining = 0.0
 
         # CRUISE -> APPROACH_RED -> STOPPED_RED -> GO -> CRUISE
         self.drive_state = "CRUISE"
@@ -330,12 +339,58 @@ class MotionPlanningNode(Node):
 
         return self.driving_speed
 
+    def steering_delay_active(self, heading_error, lateral_error):
+        """코너를 처음 감지한 뒤 설정된 시간 동안 조향 진입을 늦춘다."""
+        abs_heading = abs(heading_error)
+        abs_lateral = abs(lateral_error)
+        curve_detected = (
+            abs_heading >= MEDIUM_CURVE_DEG
+            or abs_lateral >= LATERAL_MEDIUM_PX
+        )
+        curve_cleared = (
+            abs_heading < MEDIUM_CURVE_DEG * 0.5
+            and abs_lateral < LATERAL_MEDIUM_PX * 0.5
+        )
+
+        now_ns = self.now_ns()
+
+        if self.curve_entry_time_ns is None:
+            if not curve_detected:
+                self.last_steering_delay_remaining = 0.0
+                return False
+            self.curve_entry_time_ns = now_ns
+        elif curve_cleared:
+            self.curve_entry_time_ns = None
+            self.last_steering_delay_remaining = 0.0
+            return False
+
+        elapsed_sec = (now_ns - self.curve_entry_time_ns) / 1e9
+        self.last_steering_delay_remaining = max(
+            0.0,
+            self.steering_delay_sec - elapsed_sec
+        )
+        return self.last_steering_delay_remaining > 0.0
+
     def calculate_stable_steering(self):
         errors = self.calculate_path_errors()
         if errors is None:
             return None, 0.0, 0.0, 0.0, self.driving_speed
 
         heading_error, lateral_error = errors
+
+        curve_speed = self.select_curve_speed(
+            heading_error,
+            lateral_error
+        )
+
+        if self.steering_delay_active(heading_error, lateral_error):
+            # 대기 중 조향 필터가 내부적으로 누적되어 2초 뒤 갑자기 튀지 않게 한다.
+            self.filtered_steering = 0.0
+            self.last_heading_error = heading_error
+            self.last_lateral_error = lateral_error
+            self.last_curve_speed = curve_speed
+            self.last_step_limit = self.steering_step_turn_in
+            return 0, heading_error, lateral_error, 0.0, curve_speed
 
         heading_component = (
             0.0
@@ -375,11 +430,6 @@ class MotionPlanningNode(Node):
             min(MAX_STEERING, self.filtered_steering)
         )
 
-        curve_speed = self.select_curve_speed(
-            heading_error,
-            lateral_error
-        )
-
         self.last_heading_error = heading_error
         self.last_lateral_error = lateral_error
         self.last_curve_speed = curve_speed
@@ -398,6 +448,8 @@ class MotionPlanningNode(Node):
         self.filtered_steering = 0.0
         self.left_speed_command = 0
         self.right_speed_command = 0
+        self.curve_entry_time_ns = None
+        self.last_steering_delay_remaining = 0.0
 
     def set_lane_following_command(self, speed_override=None):
         (
@@ -558,6 +610,7 @@ class MotionPlanningNode(Node):
             f"lateral={self.last_lateral_error:.1f}px, "
             f"raw_steer={raw_steering:.2f}, "
             f"steering={self.steering_command}, "
+            f"steering_delay={self.last_steering_delay_remaining:.2f}s, "
             f"step_limit={self.last_step_limit:.2f}, "
             f"curve_speed={self.last_curve_speed}, "
             f"left_speed={self.left_speed_command}, "
