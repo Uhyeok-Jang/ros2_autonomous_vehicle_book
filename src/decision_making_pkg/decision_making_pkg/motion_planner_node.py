@@ -20,27 +20,57 @@ TIMER = 0.1
 MAX_STEERING = 7.0
 CAR_CENTER_X = 320.0
 
-# Curve tracking controller
-# 기존에는 차량 중심 -> 먼 lookahead 점의 기울기만 사용해서 코너를 안쪽으로 자르는
-# 경향이 있었다. 이제 가까운 구간의 path tangent + lateral error를 함께 사용한다.
-KP_HEADING = 0.12
-KP_LATERAL = 0.035
-STEERING_DEADBAND_DEG = 1.0
-STEERING_ALPHA = 0.30
-STEERING_STEP_TURN_IN = 0.8
-STEERING_STEP_RECOVER = 1.4
-TRACKING_FROM_END = 20
-TANGENT_SPAN = 12
+# ------------------------------------------------------------
+# Curve state machine
+#
+# STRAIGHT -> TURN_IN -> HOLD -> EXIT -> STRAIGHT
+#
+# 매 프레임 즉시 steering을 크게 바꾸는 대신,
+# 1) 코너를 미리 확인하고
+# 2) TURN_IN에서 천천히 조향을 만들고
+# 3) HOLD에서 거의 일정한 조향을 유지하고
+# 4) EXIT에서 천천히 핸들을 푼다.
+# ------------------------------------------------------------
+CURVE_ENTER_DEG = 4.0
+CURVE_EXIT_DEG = 2.0
+CURVE_CONFIRM_FRAMES = 3
+CURVE_EXIT_CONFIRM_FRAMES = 3
+HOLD_MIN_SEC = 0.45
+TURN_IN_MAX_SEC = 1.4
+
+# path에서 가까운/먼 tangent를 각각 계산한다.
+NEAR_TRACK_FROM_END = 12
+NEAR_TANGENT_SPAN = 10
+FAR_TRACK_FROM_END = 45
+FAR_TANGENT_SPAN = 12
+
+# steering command는 int32이므로 내부에서는 float으로 천천히 움직인 뒤 round한다.
+TURN_IN_RAMP_PER_TICK = 0.30
+HOLD_ADJUST_PER_TICK = 0.20
+EXIT_RAMP_PER_TICK = 0.45
+STRAIGHT_RAMP_PER_TICK = 0.25
+
+# 직선 구간에서는 작은 보정만 허용한다.
+KP_STRAIGHT_HEADING = 0.07
+KP_STRAIGHT_LATERAL = 0.018
+STRAIGHT_STEERING_LIMIT = 2.0
+
+# HOLD에서는 기본 turn steering을 거의 유지하고, lateral error만 약하게 보정한다.
+KP_HOLD_LATERAL = 0.015
+HOLD_CORRECTION_LIMIT = 0.70
+
+# 코너 안쪽을 자르는 것을 줄이기 위해 center path를 약간 바깥쪽으로 bias한다.
+OUTSIDE_OFFSET_SHALLOW_PX = 8.0
+OUTSIDE_OFFSET_MEDIUM_PX = 14.0
+OUTSIDE_OFFSET_SHARP_PX = 20.0
 
 # Curve-aware speed
 DRIVING_SPEED = 60
-MEDIUM_CURVE_SPEED = 48
-SHARP_CURVE_SPEED = 38
+SHALLOW_CURVE_SPEED = 50
+MEDIUM_CURVE_SPEED = 42
+SHARP_CURVE_SPEED = 34
+EXIT_SPEED = 42
 APPROACH_SPEED = 35
-MEDIUM_CURVE_DEG = 8.0
-SHARP_CURVE_DEG = 18.0
-LATERAL_MEDIUM_PX = 28.0
-LATERAL_SHARP_PX = 48.0
 
 PATH_TIMEOUT_SEC = 0.5
 LIGHT_CONFIRM_FRAMES = 3
@@ -67,42 +97,8 @@ class MotionPlanningNode(Node):
             'pub_topic', PUB_TOPIC_NAME).value
         self.timer_period = self.declare_parameter('timer', TIMER).value
 
-        self.kp_heading = float(
-            self.declare_parameter('kp_heading', KP_HEADING).value)
-        self.kp_lateral = float(
-            self.declare_parameter('kp_lateral', KP_LATERAL).value)
-        self.steering_alpha = float(
-            self.declare_parameter('steering_alpha', STEERING_ALPHA).value)
-        self.steering_step_turn_in = float(
-            self.declare_parameter(
-                'steering_step_turn_in', STEERING_STEP_TURN_IN
-            ).value
-        )
-        self.steering_step_recover = float(
-            self.declare_parameter(
-                'steering_step_recover', STEERING_STEP_RECOVER
-            ).value
-        )
-        self.tracking_from_end = int(
-            self.declare_parameter(
-                'tracking_from_end', TRACKING_FROM_END
-            ).value
-        )
-        self.tangent_span = int(
-            self.declare_parameter('tangent_span', TANGENT_SPAN).value)
-
         self.driving_speed = int(
             self.declare_parameter('driving_speed', DRIVING_SPEED).value)
-        self.medium_curve_speed = int(
-            self.declare_parameter(
-                'medium_curve_speed', MEDIUM_CURVE_SPEED
-            ).value
-        )
-        self.sharp_curve_speed = int(
-            self.declare_parameter(
-                'sharp_curve_speed', SHARP_CURVE_SPEED
-            ).value
-        )
         self.approach_speed = int(
             self.declare_parameter('approach_speed', APPROACH_SPEED).value)
         self.path_timeout_sec = float(
@@ -139,13 +135,27 @@ class MotionPlanningNode(Node):
         self.steering_command = 0
         self.left_speed_command = 0
         self.right_speed_command = 0
+
+        # 실제 actuator에 보내기 전 내부 float steering.
         self.filtered_steering = 0.0
 
-        self.last_heading_error = 0.0
-        self.last_lateral_error = 0.0
-        self.last_curve_speed = self.driving_speed
-        self.last_step_limit = self.steering_step_turn_in
+        # Curve state machine state.
+        self.curve_state = "STRAIGHT"
+        self.curve_direction = 0   # left=-1, right=+1
+        self.curve_entry_count = 0
+        self.curve_exit_count = 0
+        self.curve_state_start_ns = self.now_ns()
+        self.turn_target_steering = 0.0
 
+        # Debug values.
+        self.last_near_heading = 0.0
+        self.last_far_heading = 0.0
+        self.last_lateral_error = 0.0
+        self.last_outside_offset = 0.0
+        self.last_curve_speed = self.driving_speed
+        self.last_turn_target = 0.0
+
+        # Traffic state machine.
         # CRUISE -> APPROACH_RED -> STOPPED_RED -> GO -> CRUISE
         self.drive_state = "CRUISE"
         self.go_start_time_ns = None
@@ -182,6 +192,9 @@ class MotionPlanningNode(Node):
 
     def now_ns(self):
         return self.get_clock().now().nanoseconds
+
+    def elapsed_sec(self, start_ns):
+        return (self.now_ns() - start_ns) / 1e9
 
     def detection_callback(self, msg: DetectionArray):
         self.detection_data = msg
@@ -278,151 +291,383 @@ class MotionPlanningNode(Node):
 
         return None
 
-    def calculate_path_errors(self):
-        """가까운 path의 tangent와 lateral error를 함께 계산한다.
+    @staticmethod
+    def tangent_heading(point_a, point_b):
+        denominator = point_a[1] - point_b[1]
+        if abs(denominator) < 1e-6:
+            return 0.0
 
-        예전 방식은 차량 중심에서 먼 lookahead 한 점까지의 chord 각도를 썼기 때문에
-        급커브에서 코너 안쪽을 잘라가는 경향이 있었다. 여기서는 차량에 더 가까운
-        path 구간의 local tangent를 사용하고, target path가 차량 중심에서 얼마나
-        좌/우로 벗어나 있는지도 별도 오차로 사용한다.
-        """
-        if not self.has_fresh_path() or len(self.path_data) < 4:
+        return math.degrees(
+            math.atan(
+                (point_b[0] - point_a[0]) / denominator
+            )
+        )
+
+    def calculate_path_geometry(self):
+        if not self.has_fresh_path() or len(self.path_data) < 12:
             return None
 
         n = len(self.path_data)
-        track_idx = max(1, n - max(4, self.tracking_from_end))
-        track_idx = min(track_idx, n - 2)
-        far_idx = max(0, track_idx - max(2, self.tangent_span))
 
+        near_idx = max(2, n - NEAR_TRACK_FROM_END)
+        near_start = max(0, near_idx - NEAR_TANGENT_SPAN)
+
+        far_idx = max(2, n - FAR_TRACK_FROM_END)
+        far_start = max(0, far_idx - FAR_TANGENT_SPAN)
+
+        near_point = self.path_data[near_idx]
+        near_start_point = self.path_data[near_start]
         far_point = self.path_data[far_idx]
-        track_point = self.path_data[track_idx]
+        far_start_point = self.path_data[far_start]
 
-        denominator = far_point[1] - track_point[1]
-        if abs(denominator) < 1e-6:
-            heading_error = 0.0
-        else:
-            # 기존 조향 부호 체계 유지:
-            # path가 왼쪽으로 꺾이면 negative, 오른쪽이면 positive.
-            heading_error = math.degrees(
-                math.atan(
-                    (track_point[0] - far_point[0]) / denominator
+        near_heading = self.tangent_heading(
+            near_start_point,
+            near_point
+        )
+        far_heading = self.tangent_heading(
+            far_start_point,
+            far_point
+        )
+
+        lateral_error = float(near_point[0] - CAR_CENTER_X)
+
+        return near_heading, far_heading, lateral_error
+
+    @staticmethod
+    def sign(value):
+        if value > 0.0:
+            return 1
+        if value < 0.0:
+            return -1
+        return 0
+
+    @staticmethod
+    def ramp_toward(current, target, step):
+        if current < target:
+            return min(target, current + step)
+        if current > target:
+            return max(target, current - step)
+        return current
+
+    @staticmethod
+    def steering_target_magnitude(severity_deg):
+        severity = abs(severity_deg)
+
+        if severity < 8.0:
+            return 2.0
+        if severity < 15.0:
+            return 3.0
+        if severity < 24.0:
+            return 4.0
+        return 5.0
+
+    @staticmethod
+    def outside_offset_magnitude(severity_deg):
+        severity = abs(severity_deg)
+
+        if severity < 8.0:
+            return OUTSIDE_OFFSET_SHALLOW_PX
+        if severity < 15.0:
+            return OUTSIDE_OFFSET_MEDIUM_PX
+        return OUTSIDE_OFFSET_SHARP_PX
+
+    @staticmethod
+    def curve_speed_from_target(target_magnitude):
+        magnitude = abs(target_magnitude)
+
+        if magnitude >= 4.0:
+            return SHARP_CURVE_SPEED
+        if magnitude >= 3.0:
+            return MEDIUM_CURVE_SPEED
+        return SHALLOW_CURVE_SPEED
+
+    def set_curve_state(self, new_state):
+        if new_state == self.curve_state:
+            return
+
+        self.get_logger().info(
+            f"CURVE_STATE {self.curve_state} -> {new_state}"
+        )
+
+        self.curve_state = new_state
+        self.curve_state_start_ns = self.now_ns()
+        self.curve_entry_count = 0
+        self.curve_exit_count = 0
+
+        if new_state == "STRAIGHT":
+            self.curve_direction = 0
+            self.turn_target_steering = 0.0
+
+    def reset_curve_controller(self):
+        self.curve_state = "STRAIGHT"
+        self.curve_direction = 0
+        self.curve_entry_count = 0
+        self.curve_exit_count = 0
+        self.curve_state_start_ns = self.now_ns()
+        self.turn_target_steering = 0.0
+        self.filtered_steering = 0.0
+
+    def update_curve_state(self, near_heading, far_heading):
+        # 코너 진입은 먼 path를 먼저 본다.
+        entry_heading = (
+            far_heading
+            if abs(far_heading) >= abs(near_heading)
+            else near_heading
+        )
+        entry_direction = self.sign(entry_heading)
+        entry_strength = abs(entry_heading)
+
+        if self.curve_state == "STRAIGHT":
+            if (
+                entry_direction != 0
+                and entry_strength >= CURVE_ENTER_DEG
+            ):
+                self.curve_entry_count += 1
+            else:
+                self.curve_entry_count = 0
+
+            if self.curve_entry_count >= CURVE_CONFIRM_FRAMES:
+                self.curve_direction = entry_direction
+                magnitude = self.steering_target_magnitude(
+                    entry_strength
                 )
+                self.turn_target_steering = (
+                    self.curve_direction * magnitude
+                )
+                self.set_curve_state("TURN_IN")
+
+        elif self.curve_state == "TURN_IN":
+            # 같은 방향의 코너가 더 급해지면 목표 조향은 증가시킬 수 있다.
+            same_direction_strengths = [
+                abs(h)
+                for h in (near_heading, far_heading)
+                if self.sign(h) == self.curve_direction
+            ]
+            if same_direction_strengths:
+                severity = max(same_direction_strengths)
+                new_mag = self.steering_target_magnitude(severity)
+                if new_mag > abs(self.turn_target_steering):
+                    self.turn_target_steering = (
+                        self.curve_direction * new_mag
+                    )
+
+            reached_target = (
+                abs(
+                    self.filtered_steering
+                    - self.turn_target_steering
+                ) <= 0.35
+            )
+            timed_out = (
+                self.elapsed_sec(self.curve_state_start_ns)
+                >= TURN_IN_MAX_SEC
             )
 
-        lateral_error = float(track_point[0] - CAR_CENTER_X)
-        return heading_error, lateral_error
+            if reached_target or timed_out:
+                self.set_curve_state("HOLD")
 
-    def select_curve_speed(self, heading_error, lateral_error):
-        abs_heading = abs(heading_error)
-        abs_lateral = abs(lateral_error)
+        elif self.curve_state == "HOLD":
+            if self.elapsed_sec(self.curve_state_start_ns) < HOLD_MIN_SEC:
+                self.curve_exit_count = 0
+                return
 
-        if (
-            abs_heading >= SHARP_CURVE_DEG
-            or abs_lateral >= LATERAL_SHARP_PX
-        ):
-            return self.sharp_curve_speed
+            # 1) 가까운 path가 거의 펴졌거나
+            # 2) 먼 path에서 반대 방향 S-curve가 보이면
+            # 핸들을 풀기 시작한다.
+            near_is_straight = abs(near_heading) <= CURVE_EXIT_DEG
+            far_is_opposite = (
+                self.sign(far_heading) == -self.curve_direction
+                and abs(far_heading) >= CURVE_ENTER_DEG
+            )
 
-        if (
-            abs_heading >= MEDIUM_CURVE_DEG
-            or abs_lateral >= LATERAL_MEDIUM_PX
-        ):
-            return self.medium_curve_speed
+            if near_is_straight or far_is_opposite:
+                self.curve_exit_count += 1
+            else:
+                self.curve_exit_count = 0
 
-        return self.driving_speed
+            if self.curve_exit_count >= CURVE_EXIT_CONFIRM_FRAMES:
+                self.set_curve_state("EXIT")
 
-    def calculate_stable_steering(self):
-        errors = self.calculate_path_errors()
-        if errors is None:
-            return None, 0.0, 0.0, 0.0, self.driving_speed
+        elif self.curve_state == "EXIT":
+            if abs(self.filtered_steering) <= 0.35:
+                self.filtered_steering = 0.0
 
-        heading_error, lateral_error = errors
+                # S-curve이면 곧바로 다음 방향 TURN_IN 준비.
+                next_heading = (
+                    far_heading
+                    if abs(far_heading) >= abs(near_heading)
+                    else near_heading
+                )
+                next_direction = self.sign(next_heading)
 
-        heading_component = (
-            0.0
-            if abs(heading_error) < STEERING_DEADBAND_DEG
-            else self.kp_heading * heading_error
+                if (
+                    next_direction != 0
+                    and abs(next_heading) >= CURVE_ENTER_DEG
+                ):
+                    self.curve_direction = next_direction
+                    magnitude = self.steering_target_magnitude(
+                        abs(next_heading)
+                    )
+                    self.turn_target_steering = (
+                        next_direction * magnitude
+                    )
+                    self.set_curve_state("TURN_IN")
+                else:
+                    self.set_curve_state("STRAIGHT")
+
+    def calculate_curve_command(self):
+        geometry = self.calculate_path_geometry()
+        if geometry is None:
+            return None
+
+        near_heading, far_heading, lateral_error = geometry
+
+        self.update_curve_state(
+            near_heading,
+            far_heading
         )
-        lateral_component = self.kp_lateral * lateral_error
-        raw_steering = heading_component + lateral_component
-        raw_steering = max(
-            -MAX_STEERING,
-            min(MAX_STEERING, raw_steering)
+
+        severity = max(
+            abs(near_heading),
+            abs(far_heading)
         )
 
-        alpha = max(0.0, min(1.0, self.steering_alpha))
-        smoothed = (
-            alpha * raw_steering
-            + (1.0 - alpha) * self.filtered_steering
-        )
+        outside_offset = 0.0
+        if self.curve_direction != 0:
+            outside_offset = (
+                -self.curve_direction
+                * self.outside_offset_magnitude(severity)
+            )
 
-        # 코너 진입 시에는 조향이 너무 빨리 커지지 않게 제한하고,
-        # 조향을 풀거나 S-curve에서 반대 방향으로 바꿀 때는 더 빠르게 복귀시킨다.
-        same_direction = self.filtered_steering * raw_steering >= 0.0
-        increasing_magnitude = abs(raw_steering) > abs(self.filtered_steering)
+        adjusted_lateral = lateral_error + outside_offset
 
-        if same_direction and increasing_magnitude:
-            step_limit = self.steering_step_turn_in
-        else:
-            step_limit = self.steering_step_recover
+        if self.curve_state == "STRAIGHT":
+            raw_target = (
+                KP_STRAIGHT_HEADING * near_heading
+                + KP_STRAIGHT_LATERAL * lateral_error
+            )
+            raw_target = max(
+                -STRAIGHT_STEERING_LIMIT,
+                min(STRAIGHT_STEERING_LIMIT, raw_target)
+            )
 
-        delta = max(
-            -step_limit,
-            min(step_limit, smoothed - self.filtered_steering)
-        )
-        self.filtered_steering += delta
+            self.filtered_steering = self.ramp_toward(
+                self.filtered_steering,
+                raw_target,
+                STRAIGHT_RAMP_PER_TICK
+            )
+            speed = self.driving_speed
+
+        elif self.curve_state == "TURN_IN":
+            # 코너 진입에서는 목표 steering까지 천천히 만든다.
+            correction = max(
+                -0.45,
+                min(
+                    0.45,
+                    KP_HOLD_LATERAL * adjusted_lateral
+                )
+            )
+            target = (
+                self.turn_target_steering + correction
+            )
+
+            self.filtered_steering = self.ramp_toward(
+                self.filtered_steering,
+                target,
+                TURN_IN_RAMP_PER_TICK
+            )
+            speed = self.curve_speed_from_target(
+                self.turn_target_steering
+            )
+
+        elif self.curve_state == "HOLD":
+            # 코너 중간에서는 steering을 거의 고정한다.
+            # center path보다 바깥쪽으로 약간 bias해서 안쪽 cutting을 줄인다.
+            correction = max(
+                -HOLD_CORRECTION_LIMIT,
+                min(
+                    HOLD_CORRECTION_LIMIT,
+                    KP_HOLD_LATERAL * adjusted_lateral
+                )
+            )
+            target = (
+                self.turn_target_steering + correction
+            )
+
+            self.filtered_steering = self.ramp_toward(
+                self.filtered_steering,
+                target,
+                HOLD_ADJUST_PER_TICK
+            )
+            speed = self.curve_speed_from_target(
+                self.turn_target_steering
+            )
+
+        else:  # EXIT
+            self.filtered_steering = self.ramp_toward(
+                self.filtered_steering,
+                0.0,
+                EXIT_RAMP_PER_TICK
+            )
+            speed = EXIT_SPEED
+
         self.filtered_steering = max(
             -MAX_STEERING,
             min(MAX_STEERING, self.filtered_steering)
         )
 
-        curve_speed = self.select_curve_speed(
-            heading_error,
-            lateral_error
-        )
+        command = int(round(self.filtered_steering))
 
-        self.last_heading_error = heading_error
+        self.last_near_heading = near_heading
+        self.last_far_heading = far_heading
         self.last_lateral_error = lateral_error
-        self.last_curve_speed = curve_speed
-        self.last_step_limit = step_limit
+        self.last_outside_offset = outside_offset
+        self.last_curve_speed = speed
+        self.last_turn_target = self.turn_target_steering
 
         return (
-            int(round(self.filtered_steering)),
-            heading_error,
+            command,
+            near_heading,
+            far_heading,
             lateral_error,
-            raw_steering,
-            curve_speed
+            outside_offset,
+            speed
         )
 
     def stop_vehicle(self):
         self.steering_command = 0
-        self.filtered_steering = 0.0
         self.left_speed_command = 0
         self.right_speed_command = 0
+        self.reset_curve_controller()
 
     def set_lane_following_command(self, speed_override=None):
-        (
-            command,
-            heading_error,
-            lateral_error,
-            raw_steering,
-            curve_speed
-        ) = self.calculate_stable_steering()
+        result = self.calculate_curve_command()
 
-        if command is None:
+        if result is None:
             self.stop_vehicle()
             return 0.0, 0.0
+
+        (
+            command,
+            near_heading,
+            far_heading,
+            lateral_error,
+            outside_offset,
+            curve_speed
+        ) = result
 
         if speed_override is None:
             speed = curve_speed
         else:
-            # 신호 접근 속도와 curve-aware 속도 중 더 느린 값을 사용한다.
-            speed = min(int(speed_override), int(curve_speed))
+            speed = min(
+                int(speed_override),
+                int(curve_speed)
+            )
 
         self.steering_command = command
         self.left_speed_command = speed
         self.right_speed_command = speed
 
-        return heading_error, raw_steering
+        return near_heading, self.filtered_steering
 
     def set_state(self, new_state):
         if new_state == self.drive_state:
@@ -446,14 +691,12 @@ class MotionPlanningNode(Node):
         )
 
     def run_traffic_state_machine(self):
-        # stop_zone 자체는 통과 가능하다.
-        # 안정적으로 확인된 Red + stop_zone일 때만 정지 절차를 시작한다.
         zone_ymax = self.get_stop_zone_ymax()
         red_confirmed = self.is_red_confirmed()
         green_confirmed = self.is_green_confirmed()
 
-        target_slope = 0.0
-        raw_steering = 0.0
+        near_heading = 0.0
+        steering_float = 0.0
 
         if self.drive_state == "CRUISE":
             if red_confirmed and zone_ymax is not None:
@@ -462,32 +705,32 @@ class MotionPlanningNode(Node):
                     self.stop_vehicle()
                 else:
                     self.set_state("APPROACH_RED")
-                    target_slope, raw_steering = (
+                    near_heading, steering_float = (
                         self.set_lane_following_command(
                             self.approach_speed
                         )
                     )
             else:
-                target_slope, raw_steering = (
+                near_heading, steering_float = (
                     self.set_lane_following_command()
                 )
 
         elif self.drive_state == "APPROACH_RED":
             if green_confirmed:
                 self.set_state("GO")
-                target_slope, raw_steering = (
+                near_heading, steering_float = (
                     self.set_lane_following_command()
                 )
             elif zone_ymax is None:
                 self.set_state("CRUISE")
-                target_slope, raw_steering = (
+                near_heading, steering_float = (
                     self.set_lane_following_command()
                 )
             elif zone_ymax >= self.stop_zone_stop_y:
                 self.set_state("STOPPED_RED")
                 self.stop_vehicle()
             else:
-                target_slope, raw_steering = (
+                near_heading, steering_float = (
                     self.set_lane_following_command(
                         self.approach_speed
                     )
@@ -496,14 +739,14 @@ class MotionPlanningNode(Node):
         elif self.drive_state == "STOPPED_RED":
             if green_confirmed:
                 self.set_state("GO")
-                target_slope, raw_steering = (
+                near_heading, steering_float = (
                     self.set_lane_following_command()
                 )
             else:
                 self.stop_vehicle()
 
         elif self.drive_state == "GO":
-            target_slope, raw_steering = (
+            near_heading, steering_float = (
                 self.set_lane_following_command()
             )
             if self.go_clear_elapsed():
@@ -511,21 +754,21 @@ class MotionPlanningNode(Node):
 
         else:
             self.set_state("CRUISE")
-            target_slope, raw_steering = (
+            near_heading, steering_float = (
                 self.set_lane_following_command()
             )
 
         return (
-            target_slope,
-            raw_steering,
+            near_heading,
+            steering_float,
             zone_ymax,
             red_confirmed,
             green_confirmed
         )
 
     def timer_callback(self):
-        target_slope = 0.0
-        raw_steering = 0.0
+        near_heading = 0.0
+        steering_float = 0.0
         zone_ymax = self.get_stop_zone_ymax()
         red_confirmed = self.is_red_confirmed()
         green_confirmed = self.is_green_confirmed()
@@ -537,8 +780,8 @@ class MotionPlanningNode(Node):
             self.stop_vehicle()
         else:
             (
-                target_slope,
-                raw_steering,
+                near_heading,
+                steering_float,
                 zone_ymax,
                 red_confirmed,
                 green_confirmed
@@ -551,17 +794,18 @@ class MotionPlanningNode(Node):
         )
 
         self.get_logger().info(
-            f"state={self.drive_state}, "
+            f"traffic={self.drive_state}, "
+            f"curve={self.curve_state}, "
             f"zone_ymax={zone_text}, "
             f"red={red_confirmed}, green={green_confirmed}, "
-            f"heading={self.last_heading_error:.2f}, "
+            f"near={self.last_near_heading:.2f}, "
+            f"far={self.last_far_heading:.2f}, "
             f"lateral={self.last_lateral_error:.1f}px, "
-            f"raw_steer={raw_steering:.2f}, "
+            f"outside={self.last_outside_offset:.1f}px, "
+            f"turn_target={self.last_turn_target:.2f}, "
+            f"steering_float={self.filtered_steering:.2f}, "
             f"steering={self.steering_command}, "
-            f"step_limit={self.last_step_limit:.2f}, "
-            f"curve_speed={self.last_curve_speed}, "
-            f"left_speed={self.left_speed_command}, "
-            f"right_speed={self.right_speed_command}"
+            f"speed={self.left_speed_command}"
         )
 
         motion_command_msg = MotionCommand()
