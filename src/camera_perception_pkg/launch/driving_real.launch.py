@@ -49,7 +49,7 @@ def generate_launch_description():
             parameters=[{
                 'model': LaunchConfiguration('yolo_model'),
                 'device': 'cuda:0',
-                'threshold': 0.4,
+                'threshold': 0.3,
             }]
         ),
 

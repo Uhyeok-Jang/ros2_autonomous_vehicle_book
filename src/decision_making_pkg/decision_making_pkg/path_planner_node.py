@@ -30,6 +30,7 @@ class PathPlannerNode(Node):
         )
 
         self.target_points = []
+        self.plan_count = 0
 
         self.lane_sub = self.create_subscription(
             LaneInfo,
@@ -83,11 +84,13 @@ class PathPlannerNode(Node):
         path_msg.y_points = y_new.tolist()
         self.publisher.publish(path_msg)
 
-        self.get_logger().info(
-            "anchors=" + ", ".join(
-                f"({x:.1f},{y:.1f})" for x, y in zip(x_points, y_points)
+        self.plan_count += 1
+        if self.plan_count % 30 == 0:
+            self.get_logger().info(
+                "anchors=" + ", ".join(
+                    f"({x:.1f},{y:.1f})" for x, y in zip(x_points, y_points)
+                )
             )
-        )
 
         self.target_points.clear()
 

@@ -17,32 +17,36 @@ SUB_LIDAR_OBSTACLE_TOPIC_NAME = "lidar_obstacle_info"
 PUB_TOPIC_NAME = "topic_control_signal"
 
 TIMER = 0.1
-MAX_STEERING = 6.0
+MAX_STEERING = 5.0
 CAR_CENTER_X = 320.0
 
 # Curve tracking controller
 # 기존에는 차량 중심 -> 먼 lookahead 점의 기울기만 사용해서 코너를 안쪽으로 자르는
 # 경향이 있었다. 이제 가까운 구간의 path tangent + lateral error를 함께 사용한다.
-KP_HEADING = 0.13
-KP_LATERAL = 0.035
+KP_HEADING = 0.09
+KP_LATERAL = 0.030
 STEERING_DEADBAND_DEG = 1.0
-STEERING_ALPHA = 0.30
-STEERING_STEP_TURN_IN = 0.8
-STEERING_STEP_RECOVER = 1.4
+STEERING_ALPHA = 0.20
+STEERING_STEP_TURN_IN = 0.50
+STEERING_STEP_RECOVER = 0.70
+STEERING_STEP_REVERSE = 0.45
 # 값이 작을수록 차량에 가까운 경로만 사용하므로 코너 선행 조향이 줄어든다.
-TRACKING_FROM_END = 8
-TANGENT_SPAN = 5
-STEERING_DELAY_SEC = 2.0
+TRACKING_FROM_END = 6
+TANGENT_SPAN = 3
+STEERING_DELAY_SEC = 0.25
 
 # Curve-aware speed
-DRIVING_SPEED = 65
-MEDIUM_CURVE_SPEED = 60
-SHARP_CURVE_SPEED = 55
-APPROACH_SPEED = 55
+DRIVING_SPEED = 200
+MEDIUM_CURVE_SPEED = 130
+SHARP_CURVE_SPEED = 95
+VERY_SHARP_CURVE_SPEED = 75
+APPROACH_SPEED = 70
 MEDIUM_CURVE_DEG = 8.0
 SHARP_CURVE_DEG = 18.0
+VERY_SHARP_CURVE_DEG = 40.0
 LATERAL_MEDIUM_PX = 28.0
 LATERAL_SHARP_PX = 48.0
+LATERAL_VERY_SHARP_PX = 80.0
 
 PATH_TIMEOUT_SEC = 0.5
 LIGHT_CONFIRM_FRAMES = 3
@@ -85,6 +89,11 @@ class MotionPlanningNode(Node):
                 'steering_step_recover', STEERING_STEP_RECOVER
             ).value
         )
+        self.steering_step_reverse = float(
+            self.declare_parameter(
+                'steering_step_reverse', STEERING_STEP_REVERSE
+            ).value
+        )
         self.tracking_from_end = int(
             self.declare_parameter(
                 'tracking_from_end', TRACKING_FROM_END
@@ -108,6 +117,11 @@ class MotionPlanningNode(Node):
         self.sharp_curve_speed = int(
             self.declare_parameter(
                 'sharp_curve_speed', SHARP_CURVE_SPEED
+            ).value
+        )
+        self.very_sharp_curve_speed = int(
+            self.declare_parameter(
+                'very_sharp_curve_speed', VERY_SHARP_CURVE_SPEED
             ).value
         )
         self.approach_speed = int(
@@ -154,6 +168,7 @@ class MotionPlanningNode(Node):
         self.last_step_limit = self.steering_step_turn_in
         self.curve_entry_time_ns = None
         self.last_steering_delay_remaining = 0.0
+        self.log_counter = 0
 
         # CRUISE -> APPROACH_RED -> STOPPED_RED -> GO -> CRUISE
         self.drive_state = "CRUISE"
@@ -326,6 +341,12 @@ class MotionPlanningNode(Node):
         abs_lateral = abs(lateral_error)
 
         if (
+            abs_heading >= VERY_SHARP_CURVE_DEG
+            or abs_lateral >= LATERAL_VERY_SHARP_PX
+        ):
+            return self.very_sharp_curve_speed
+
+        if (
             abs_heading >= SHARP_CURVE_DEG
             or abs_lateral >= LATERAL_SHARP_PX
         ):
@@ -410,12 +431,21 @@ class MotionPlanningNode(Node):
             + (1.0 - alpha) * self.filtered_steering
         )
 
-        # 코너 진입 시에는 조향이 너무 빨리 커지지 않게 제한하고,
-        # 조향을 풀거나 S-curve에서 반대 방향으로 바꿀 때는 더 빠르게 복귀시킨다.
+        # 코너 감지 시점은 그대로 유지하되 조향 명령의 변화만 부드럽게 만든다.
+        # 특히 segmentation 경계가 바뀌는 한두 프레임 때문에 반대 방향으로
+        # 급전환하지 않도록 방향 반전에는 가장 작은 변화량을 사용한다.
         same_direction = self.filtered_steering * raw_steering >= 0.0
         increasing_magnitude = abs(raw_steering) > abs(self.filtered_steering)
 
-        if same_direction and increasing_magnitude:
+        reversing_direction = (
+            self.filtered_steering * raw_steering < 0.0
+            and abs(self.filtered_steering) >= 0.5
+            and abs(raw_steering) >= 0.5
+        )
+
+        if reversing_direction:
+            step_limit = self.steering_step_reverse
+        elif same_direction and increasing_magnitude:
             step_limit = self.steering_step_turn_in
         else:
             step_limit = self.steering_step_recover
@@ -602,20 +632,22 @@ class MotionPlanningNode(Node):
             else f"{zone_ymax:.1f}"
         )
 
-        self.get_logger().info(
-            f"state={self.drive_state}, "
-            f"zone_ymax={zone_text}, "
-            f"red={red_confirmed}, green={green_confirmed}, "
-            f"heading={self.last_heading_error:.2f}, "
-            f"lateral={self.last_lateral_error:.1f}px, "
-            f"raw_steer={raw_steering:.2f}, "
-            f"steering={self.steering_command}, "
-            f"steering_delay={self.last_steering_delay_remaining:.2f}s, "
-            f"step_limit={self.last_step_limit:.2f}, "
-            f"curve_speed={self.last_curve_speed}, "
-            f"left_speed={self.left_speed_command}, "
-            f"right_speed={self.right_speed_command}"
-        )
+        self.log_counter += 1
+        if self.log_counter % 10 == 0:
+            self.get_logger().info(
+                f"state={self.drive_state}, "
+                f"zone_ymax={zone_text}, "
+                f"red={red_confirmed}, green={green_confirmed}, "
+                f"heading={self.last_heading_error:.2f}, "
+                f"lateral={self.last_lateral_error:.1f}px, "
+                f"raw_steer={raw_steering:.2f}, "
+                f"steering={self.steering_command}, "
+                f"steering_delay={self.last_steering_delay_remaining:.2f}s, "
+                f"step_limit={self.last_step_limit:.2f}, "
+                f"curve_speed={self.last_curve_speed}, "
+                f"left_speed={self.left_speed_command}, "
+                f"right_speed={self.right_speed_command}"
+            )
 
         motion_command_msg = MotionCommand()
         motion_command_msg.steering = int(self.steering_command)

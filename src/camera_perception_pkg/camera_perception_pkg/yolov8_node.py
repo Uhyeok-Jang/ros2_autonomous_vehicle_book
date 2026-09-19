@@ -271,8 +271,6 @@ class Yolov8Node(LifecycleNode):
         return keypoints_list
 
     def image_cb(self, msg: Image) -> None:
-        print(msg.header)
-
         if self.enable:
 
             # convert image + predict
