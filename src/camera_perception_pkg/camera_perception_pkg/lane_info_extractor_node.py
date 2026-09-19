@@ -18,6 +18,7 @@ ROI_IMAGE_TOPIC_NAME = "roi_image"
 SHOW_IMAGE = True
 LANE_CLASS_NAME = "lane2"
 STOP_ZONE_CLASS_NAME = "stop_zone"
+DASHED_LINE_CLASS_NAME = "dashed_line"
 BOUNDARY_CLASS_NAMES = ("dashed_line", "solid_line")
 
 # 곡선의 중앙선을 3개 점으로만 근사하면 path가 chord처럼 코너를 잘라간다.
@@ -37,6 +38,13 @@ STOP_ZONE_SMOOTHING_ALPHA = 0.18
 STOP_ZONE_MAX_TARGET_STEP_PX = 6.0
 STOP_ZONE_MIN_AREA_PX = 50
 STOP_ZONE_GRACE_FRAMES = 45
+STOP_ZONE_BOUNDARY_EXCLUSION_PX = 10
+STOP_ZONE_DASHED_MARGIN_PX = 4
+STOP_ZONE_DASHED_SEARCH_PX = 8
+STOP_ZONE_DASHED_MIN_PIXELS = 20
+STOP_ZONE_DASHED_MAX_SLOPE = 1.0
+STOP_ZONE_BRIDGE_HISTORY_WEIGHT = 0.35
+STOP_ZONE_BRIDGE_MAX_SLOPE = 0.35
 MAX_ADJACENT_TARGET_DELTA_PX = 20.0
 MAX_TARGET_DELTA_CHANGE_PX = 8.0
 LANE_MIN_SCORE = 0.30
@@ -62,6 +70,30 @@ class Yolov8InfoExtractor(Node):
         self.stop_zone_smoothing_alpha = float(self.declare_parameter('stop_zone_smoothing_alpha', STOP_ZONE_SMOOTHING_ALPHA).value)
         self.stop_zone_max_target_step_px = float(self.declare_parameter('stop_zone_max_target_step_px', STOP_ZONE_MAX_TARGET_STEP_PX).value)
         self.stop_zone_grace_frames = int(self.declare_parameter('stop_zone_grace_frames', STOP_ZONE_GRACE_FRAMES).value)
+        self.stop_zone_boundary_exclusion_px = int(
+            self.declare_parameter(
+                'stop_zone_boundary_exclusion_px',
+                STOP_ZONE_BOUNDARY_EXCLUSION_PX,
+            ).value
+        )
+        self.stop_zone_dashed_margin_px = int(
+            self.declare_parameter(
+                'stop_zone_dashed_margin_px',
+                STOP_ZONE_DASHED_MARGIN_PX,
+            ).value
+        )
+        self.stop_zone_bridge_history_weight = float(
+            self.declare_parameter(
+                'stop_zone_bridge_history_weight',
+                STOP_ZONE_BRIDGE_HISTORY_WEIGHT,
+            ).value
+        )
+        self.stop_zone_bridge_max_slope = float(
+            self.declare_parameter(
+                'stop_zone_bridge_max_slope',
+                STOP_ZONE_BRIDGE_MAX_SLOPE,
+            ).value
+        )
         self.max_adjacent_target_delta_px = float(self.declare_parameter('max_adjacent_target_delta_px', MAX_ADJACENT_TARGET_DELTA_PX).value)
         self.max_target_delta_change_px = float(self.declare_parameter('max_target_delta_change_px', MAX_TARGET_DELTA_CHANGE_PX).value)
 
@@ -170,14 +202,199 @@ class Yolov8InfoExtractor(Node):
             if len(run) >= 2
         ]
 
-    def estimate_target_x(self, drivable_roi, boundary_roi, target_y, target_idx):
+    @staticmethod
+    def build_lane2_from_stop_zone(
+        stop_zone_roi,
+        dashed_roi,
+        reference_centers,
+        target_y_values,
+        dashed_margin_px,
+    ):
+        """Recover only the lane2 side of a stop zone split by dashed_line."""
+        recovered = np.zeros_like(stop_zone_roi)
+        if (
+            cv2.countNonZero(stop_zone_roi) == 0
+            or cv2.countNonZero(dashed_roi) == 0
+        ):
+            return recovered
+
+        search_kernel_size = 2 * STOP_ZONE_DASHED_SEARCH_PX + 1
+        stop_zone_search = cv2.dilate(
+            stop_zone_roi,
+            np.ones(
+                (search_kernel_size, search_kernel_size),
+                dtype=np.uint8,
+            ),
+        )
+        dashed_inside_zone = cv2.bitwise_and(dashed_roi, stop_zone_search)
+        dashed_y, dashed_x = np.where(dashed_inside_zone > 0)
+        if dashed_x.size < STOP_ZONE_DASHED_MIN_PIXELS:
+            return recovered
+
+        sampled_y = np.unique(dashed_y)
+        if sampled_y.size < 3:
+            return recovered
+        sampled_x = np.asarray([
+            np.median(dashed_x[dashed_y == y]) for y in sampled_y
+        ])
+
+        slope = float(np.polyfit(sampled_y, sampled_x, 1)[0])
+        slope = float(np.clip(
+            slope,
+            -STOP_ZONE_DASHED_MAX_SLOPE,
+            STOP_ZONE_DASHED_MAX_SLOPE,
+        ))
+        intercept = float(np.median(sampled_x - slope * sampled_y))
+
+        valid_reference = [
+            (float(y), float(x))
+            for y, x in zip(target_y_values, reference_centers)
+            if x is not None
+        ]
+        if not valid_reference:
+            return recovered
+
+        reference_y = np.asarray(
+            [item[0] for item in valid_reference],
+            dtype=np.float64,
+        )
+        reference_x = np.asarray(
+            [item[1] for item in valid_reference],
+            dtype=np.float64,
+        )
+        interpolated_reference = np.interp(
+            sampled_y.astype(np.float64),
+            reference_y,
+            reference_x,
+        )
+        side_offset = float(np.median(
+            interpolated_reference - (slope * sampled_y + intercept)
+        ))
+        margin = max(0, int(dashed_margin_px))
+        if abs(side_offset) <= margin:
+            return recovered
+
+        lane2_is_right = side_offset > 0.0
+        stop_rows = np.where(np.any(stop_zone_roi > 0, axis=1))[0]
+        for y in stop_rows:
+            stop_columns = np.where(stop_zone_roi[y, :] > 0)[0]
+            boundary_x = slope * float(y) + intercept
+            if lane2_is_right:
+                selected = stop_columns[
+                    stop_columns >= int(np.ceil(boundary_x + margin))
+                ]
+            else:
+                selected = stop_columns[
+                    stop_columns <= int(np.floor(boundary_x - margin))
+                ]
+            recovered[y, selected] = 255
+
+        return cv2.morphologyEx(
+            recovered,
+            cv2.MORPH_CLOSE,
+            np.ones((3, 3), dtype=np.uint8),
+        )
+
+    @staticmethod
+    def build_stop_zone_bridge(
+        measured_centers,
+        previous_targets,
+        target_y_values,
+        history_weight,
+        max_slope,
+    ):
+        """Fill lane2 rows hidden by a stop-zone mask without using its shape.
+
+        The visible lane2 centers determine the current travel direction. Only
+        missing rows are extrapolated, then blended with the previous complete
+        path so the stop-zone class cannot create a lateral avoidance command.
+        """
+        valid = [
+            (float(y), float(x))
+            for y, x in zip(target_y_values, measured_centers)
+            if x is not None
+        ]
+        previous_is_complete = (
+            len(previous_targets) == len(target_y_values)
+            and all(value is not None for value in previous_targets)
+        )
+        if not valid:
+            return (
+                [float(value) for value in previous_targets]
+                if previous_is_complete
+                else [None] * len(target_y_values)
+            )
+
+        valid_y = np.asarray([item[0] for item in valid], dtype=np.float64)
+        valid_x = np.asarray([item[1] for item in valid], dtype=np.float64)
+
+        if len(valid) >= 2:
+            slope = float(np.polyfit(valid_y, valid_x, 1)[0])
+            slope = float(np.clip(slope, -abs(max_slope), abs(max_slope)))
+            intercept = float(np.median(valid_x - slope * valid_y))
+            predicted = [slope * float(y) + intercept for y in target_y_values]
+        elif previous_is_complete:
+            anchor_y, anchor_x = valid[0]
+            anchor_index = min(
+                range(len(target_y_values)),
+                key=lambda idx: abs(float(target_y_values[idx]) - anchor_y),
+            )
+            offset = anchor_x - float(previous_targets[anchor_index])
+            predicted = [float(value) + offset for value in previous_targets]
+        else:
+            predicted = [valid[0][1]] * len(target_y_values)
+
+        history_weight = float(np.clip(history_weight, 0.0, 1.0))
+        bridge = []
+        for index, (measured_x, predicted_x) in enumerate(
+            zip(measured_centers, predicted)
+        ):
+            if measured_x is not None:
+                bridge.append(None)
+                continue
+
+            if previous_is_complete:
+                predicted_x = (
+                    (1.0 - history_weight) * predicted_x
+                    + history_weight * float(previous_targets[index])
+                )
+            bridge.append(float(predicted_x))
+
+        return bridge
+
+    def exclude_stop_zone_boundaries(self, boundary_roi, stop_zone_roi):
+        """Remove transverse stop-zone pixels from longitudinal boundaries."""
+        radius = max(0, self.stop_zone_boundary_exclusion_px)
+        if radius == 0 or cv2.countNonZero(stop_zone_roi) == 0:
+            return boundary_roi
+
+        kernel_size = 2 * radius + 1
+        stop_zone_guard = cv2.dilate(
+            stop_zone_roi,
+            np.ones((kernel_size, kernel_size), dtype=np.uint8),
+        )
+        return cv2.bitwise_and(
+            boundary_roi,
+            cv2.bitwise_not(stop_zone_guard),
+        )
+
+    def estimate_target_x(
+        self,
+        drivable_roi,
+        boundary_roi,
+        target_y,
+        target_idx,
+        base_x=None,
+        bridge_x=None,
+    ):
         _, w = drivable_roi.shape[:2]
-        base_x = self.choose_drivable_run(drivable_roi, target_y, target_idx)
         previous_x = self.prev_target_x[target_idx]
         # 현재 프레임의 stop-zone/lane 마스크가 흔들려도 경계선의 좌우가
         # 뒤집히지 않도록 이전 경로점을 우선 기준으로 사용한다.
         reference_x = previous_x if previous_x is not None else (
-            base_x if base_x is not None else w / 2.0
+            base_x if base_x is not None else (
+                bridge_x if bridge_x is not None else w / 2.0
+            )
         )
 
         boundary_centers = self.get_boundary_centers(boundary_roi, target_y)
@@ -186,10 +403,37 @@ class Yolov8InfoExtractor(Node):
         left_boundary = max(left_boundaries) if left_boundaries else None
         right_boundary = min(right_boundaries) if right_boundaries else None
 
-        measured_x = base_x
-        mode = "drivable"
+        measured_x = base_x if base_x is not None else bridge_x
+        mode = "drivable" if base_x is not None else "stop_zone_bridge"
 
-        if (
+        if self.stop_zone_visible and measured_x is not None:
+            # lane2 또는 그 연장선을 주 경로로 사용한다. 경계는 안전 범위로
+            # 제한할 뿐 중심을 다시 계산하지 않으므로 stop zone을 피하지 않는다.
+            if (
+                left_boundary is not None
+                and right_boundary is not None
+                and (right_boundary - left_boundary) >= MIN_CORRIDOR_WIDTH
+            ):
+                safe_left = left_boundary + self.boundary_margin_px
+                safe_right = right_boundary - self.boundary_margin_px
+                if safe_left <= safe_right:
+                    measured_x = float(np.clip(measured_x, safe_left, safe_right))
+            elif left_boundary is not None:
+                measured_x = max(
+                    measured_x,
+                    left_boundary + self.boundary_margin_px,
+                )
+            elif right_boundary is not None:
+                measured_x = min(
+                    measured_x,
+                    right_boundary - self.boundary_margin_px,
+                )
+            mode = (
+                "stop_zone_lane_follow"
+                if base_x is not None
+                else "stop_zone_bridge"
+            )
+        elif (
             left_boundary is not None
             and right_boundary is not None
             and (right_boundary - left_boundary) >= MIN_CORRIDOR_WIDTH
@@ -233,22 +477,14 @@ class Yolov8InfoExtractor(Node):
                     previous_x if previous_x is not None else w / 2.0
                 )
             measured_x = max(measured_x, left_boundary + self.boundary_margin_px)
-            mode = (
-                "stop_zone_left_boundary_lane"
-                if self.stop_zone_visible and base_x is not None
-                else "left_boundary"
-            )
+            mode = "left_boundary"
         elif right_boundary is not None:
             if measured_x is None:
                 measured_x = (
                     previous_x if previous_x is not None else w / 2.0
                 )
             measured_x = min(measured_x, right_boundary - self.boundary_margin_px)
-            mode = (
-                "stop_zone_right_boundary_lane"
-                if self.stop_zone_visible and base_x is not None
-                else "right_boundary"
-            )
+            mode = "right_boundary"
         elif self.stop_zone_visible and previous_x is not None:
             measured_x = previous_x
             mode = "stop_zone_hold"
@@ -351,6 +587,12 @@ class Yolov8InfoExtractor(Node):
         stop_zone_mask = self.build_class_mask(
             detection_msg, self.stop_zone_class_name, shape, STOP_ZONE_MIN_SCORE
         )
+        dashed_mask = self.build_class_mask(
+            detection_msg,
+            DASHED_LINE_CLASS_NAME,
+            shape,
+            BOUNDARY_MIN_SCORE,
+        )
         boundary_mask = self.build_class_mask(
             detection_msg, BOUNDARY_CLASS_NAMES, shape, BOUNDARY_MIN_SCORE
         )
@@ -385,17 +627,21 @@ class Yolov8InfoExtractor(Node):
 
         drivable_bird = CPFL.bird_convert(drivable_mask, srcmat=src_mat, dstmat=dst_mat)
         stop_zone_bird = CPFL.bird_convert(stop_zone_mask, srcmat=src_mat, dstmat=dst_mat)
+        dashed_bird = CPFL.bird_convert(dashed_mask, srcmat=src_mat, dstmat=dst_mat)
         boundary_bird = CPFL.bird_convert(boundary_mask, srcmat=src_mat, dstmat=dst_mat)
 
         drivable_roi = CPFL.roi_rectangle_below(drivable_bird, cutting_idx=300)
         stop_zone_roi = CPFL.roi_rectangle_below(stop_zone_bird, cutting_idx=300)
+        dashed_roi = CPFL.roi_rectangle_below(dashed_bird, cutting_idx=300)
         boundary_roi = CPFL.roi_rectangle_below(boundary_bird, cutting_idx=300)
 
         drivable_roi = cv2.convertScaleAbs(drivable_roi)
         stop_zone_roi = cv2.convertScaleAbs(stop_zone_roi)
+        dashed_roi = cv2.convertScaleAbs(dashed_roi)
         boundary_roi = cv2.convertScaleAbs(boundary_roi)
         _, drivable_roi = cv2.threshold(drivable_roi, 80, 255, cv2.THRESH_BINARY)
         _, stop_zone_roi = cv2.threshold(stop_zone_roi, 80, 255, cv2.THRESH_BINARY)
+        _, dashed_roi = cv2.threshold(dashed_roi, 80, 255, cv2.THRESH_BINARY)
         _, boundary_roi = cv2.threshold(boundary_roi, 80, 255, cv2.THRESH_BINARY)
 
         drivable_roi = cv2.morphologyEx(
@@ -408,6 +654,41 @@ class Yolov8InfoExtractor(Node):
             cv2.MORPH_CLOSE,
             np.ones((3, 3), dtype=np.uint8)
         )
+        dashed_roi = cv2.morphologyEx(
+            dashed_roi,
+            cv2.MORPH_CLOSE,
+            np.ones((5, 3), dtype=np.uint8)
+        )
+
+        previous_target_x = list(self.prev_target_x)
+        observed_drivable_roi = drivable_roi.copy()
+        observed_lane_centers = [
+            self.choose_drivable_run(drivable_roi, target_y, idx)
+            for idx, target_y in enumerate(TARGET_Y_VALUES)
+        ]
+        reference_centers = [
+            measured_x if measured_x is not None else previous_target_x[idx]
+            for idx, measured_x in enumerate(observed_lane_centers)
+        ]
+        recovered_lane2_roi = np.zeros_like(drivable_roi)
+        if self.stop_zone_visible:
+            recovered_lane2_roi = self.build_lane2_from_stop_zone(
+                stop_zone_roi,
+                dashed_roi,
+                reference_centers,
+                TARGET_Y_VALUES,
+                self.stop_zone_dashed_margin_px,
+            )
+            drivable_roi = cv2.bitwise_or(
+                drivable_roi,
+                recovered_lane2_roi,
+            )
+
+        if self.stop_zone_visible:
+            boundary_roi = self.exclude_stop_zone_boundaries(
+                boundary_roi,
+                stop_zone_roi,
+            )
 
         has_geometry = (
             cv2.countNonZero(drivable_roi) > 0
@@ -424,7 +705,20 @@ class Yolov8InfoExtractor(Node):
             self.handle_lane_dropout()
             return
 
-        previous_target_x = list(self.prev_target_x)
+        measured_lane_centers = [
+            self.choose_drivable_run(drivable_roi, target_y, idx)
+            for idx, target_y in enumerate(TARGET_Y_VALUES)
+        ]
+        bridge_targets = [None] * len(TARGET_Y_VALUES)
+        if self.stop_zone_visible:
+            bridge_targets = self.build_stop_zone_bridge(
+                measured_lane_centers,
+                previous_target_x,
+                TARGET_Y_VALUES,
+                self.stop_zone_bridge_history_weight,
+                self.stop_zone_bridge_max_slope,
+            )
+
         target_x_values = []
         debug_boundary_pairs = []
         modes = []
@@ -434,7 +728,9 @@ class Yolov8InfoExtractor(Node):
                 drivable_roi,
                 boundary_roi,
                 target_y,
-                idx
+                idx,
+                base_x=measured_lane_centers[idx],
+                bridge_x=bridge_targets[idx],
             )
             target_x_values.append(target_x)
             debug_boundary_pairs.append((left_boundary, right_boundary))
@@ -569,16 +865,23 @@ class Yolov8InfoExtractor(Node):
         target_points = self.publish_lane(target_x_values, grad)
 
         # Debug:
-        # - 회색/흰색: lane2
-        # - 주황: stop_zone (경로 계산에서는 제외)
+        # - 회색/흰색: 원래 검출된 lane2
+        # - 주황: stop_zone
+        # - 파랑: dashed_line으로 잘라 lane2로 복원한 stop-zone 조각
         # - 노랑: dashed/solid boundary
-        # - 빨강 점: target
+        # - 빨강 점: 검출된 lane2 기반 target
+        # - 청록 점: stop-zone 때문에 누락된 lane2를 연장한 target
         # - 초록 세로선: image center
-        debug_roi = cv2.cvtColor(drivable_roi, cv2.COLOR_GRAY2BGR)
+        debug_roi = cv2.cvtColor(observed_drivable_roi, cv2.COLOR_GRAY2BGR)
         debug_roi[stop_zone_roi > 0] = (0, 165, 255)
+        debug_roi[recovered_lane2_roi > 0] = (255, 0, 0)
         debug_roi[boundary_roi > 0] = (0, 255, 255)
 
-        for point, pair in zip(target_points, debug_boundary_pairs):
+        for point, pair, mode in zip(
+            target_points,
+            debug_boundary_pairs,
+            modes,
+        ):
             left_boundary, right_boundary = pair
             y = int(point.target_y)
 
@@ -604,7 +907,7 @@ class Yolov8InfoExtractor(Node):
                 debug_roi,
                 (int(point.target_x), y),
                 5,
-                (0, 0, 255),
+                (255, 255, 0) if "bridge" in mode else (0, 0, 255),
                 -1
             )
 
@@ -633,7 +936,9 @@ class Yolov8InfoExtractor(Node):
                 + f", modes={modes}, lane_slope={grad:.2f}, "
                 + f"stop_zone={self.stop_zone_visible}"
                 + f"(raw={self.stop_zone_raw_visible}, "
-                + f"grace={self.stop_zone_frames_remaining})"
+                + f"grace={self.stop_zone_frames_remaining}), "
+                + "recovered_stop_lane_px="
+                + f"{cv2.countNonZero(recovered_lane2_roi)}"
             )
 
 

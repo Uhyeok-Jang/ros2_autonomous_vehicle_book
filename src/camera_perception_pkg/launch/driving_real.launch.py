@@ -73,7 +73,15 @@ def generate_launch_description():
         Node(
             package='camera_perception_pkg',
             executable='lane_info_extractor_node',
-            output='screen'
+            output='screen',
+            parameters=[{
+                'stop_zone_boundary_exclusion_px': 10,
+                'stop_zone_dashed_margin_px': 4,
+                'stop_zone_bridge_history_weight': 0.35,
+                'stop_zone_bridge_max_slope': 0.35,
+                'stop_zone_smoothing_alpha': 0.18,
+                'stop_zone_max_target_step_px': 6.0,
+            }]
         ),
 
         # Path planning
@@ -87,7 +95,12 @@ def generate_launch_description():
         Node(
             package='decision_making_pkg',
             executable='motion_planner_node',
-            output='screen'
+            output='screen',
+            parameters=[{
+                'stop_zone_speed': 120,
+                'stop_zone_speed_hold_sec': 1.2,
+                'speed_recovery_step': 10,
+            }]
         ),
 
         # Arduino serial output

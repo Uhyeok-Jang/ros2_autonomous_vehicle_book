@@ -41,6 +41,9 @@ MEDIUM_CURVE_SPEED = 130
 SHARP_CURVE_SPEED = 95
 VERY_SHARP_CURVE_SPEED = 75
 APPROACH_SPEED = 70
+STOP_ZONE_SPEED = 120
+STOP_ZONE_SPEED_HOLD_SEC = 1.2
+SPEED_RECOVERY_STEP = 10
 MEDIUM_CURVE_DEG = 8.0
 SHARP_CURVE_DEG = 18.0
 VERY_SHARP_CURVE_DEG = 40.0
@@ -126,6 +129,19 @@ class MotionPlanningNode(Node):
         )
         self.approach_speed = int(
             self.declare_parameter('approach_speed', APPROACH_SPEED).value)
+        self.stop_zone_speed = int(
+            self.declare_parameter('stop_zone_speed', STOP_ZONE_SPEED).value)
+        self.stop_zone_speed_hold_sec = float(
+            self.declare_parameter(
+                'stop_zone_speed_hold_sec',
+                STOP_ZONE_SPEED_HOLD_SEC
+            ).value
+        )
+        self.speed_recovery_step = int(
+            self.declare_parameter(
+                'speed_recovery_step', SPEED_RECOVERY_STEP
+            ).value
+        )
         self.path_timeout_sec = float(
             self.declare_parameter('path_timeout_sec', PATH_TIMEOUT_SEC).value)
         self.light_confirm_frames = int(
@@ -168,6 +184,7 @@ class MotionPlanningNode(Node):
         self.last_step_limit = self.steering_step_turn_in
         self.curve_entry_time_ns = None
         self.last_steering_delay_remaining = 0.0
+        self.stop_zone_speed_recovery_active = False
         self.log_counter = 0
 
         # CRUISE -> APPROACH_RED -> STOPPED_RED -> GO -> CRUISE
@@ -301,6 +318,31 @@ class MotionPlanningNode(Node):
             return self.last_stop_zone_ymax
 
         return None
+
+    def is_stop_zone_speed_active(self):
+        """Keep the speed cap briefly after the stop zone leaves the image."""
+        return (
+            self.last_stop_zone_time_ns is not None
+            and self.is_recent(
+                self.last_stop_zone_time_ns,
+                self.stop_zone_speed_hold_sec
+            )
+        )
+
+    @staticmethod
+    def limit_speed_recovery(target_speed, current_speed, recovery_step):
+        """Apply deceleration immediately and make only acceleration gradual."""
+        target_speed = max(0, int(target_speed))
+        current_speed = max(0, int(current_speed))
+        recovery_step = max(0, int(recovery_step))
+
+        if (
+            recovery_step > 0
+            and current_speed > 0
+            and target_speed > current_speed
+        ):
+            return min(target_speed, current_speed + recovery_step)
+        return target_speed
 
     def calculate_path_errors(self):
         """가까운 path의 tangent와 lateral error를 함께 계산한다.
@@ -500,6 +542,22 @@ class MotionPlanningNode(Node):
             # 신호 접근 속도와 curve-aware 속도 중 더 느린 값을 사용한다.
             speed = min(int(speed_override), int(curve_speed))
 
+        if (
+            self.stop_zone_speed_recovery_active
+            and speed_override is None
+        ):
+            current_speed = min(
+                int(self.left_speed_command),
+                int(self.right_speed_command)
+            )
+            speed = self.limit_speed_recovery(
+                speed,
+                current_speed,
+                self.speed_recovery_step
+            )
+            if speed >= self.driving_speed:
+                self.stop_zone_speed_recovery_active = False
+
         self.steering_command = command
         self.left_speed_command = speed
         self.right_speed_command = speed
@@ -533,6 +591,12 @@ class MotionPlanningNode(Node):
         zone_ymax = self.get_stop_zone_ymax()
         red_confirmed = self.is_red_confirmed()
         green_confirmed = self.is_green_confirmed()
+        stop_zone_speed_active = self.is_stop_zone_speed_active()
+        stop_zone_speed_limit = (
+            self.stop_zone_speed if stop_zone_speed_active else None
+        )
+        if stop_zone_speed_active:
+            self.stop_zone_speed_recovery_active = True
 
         target_slope = 0.0
         raw_steering = 0.0
@@ -551,19 +615,19 @@ class MotionPlanningNode(Node):
                     )
             else:
                 target_slope, raw_steering = (
-                    self.set_lane_following_command()
+                    self.set_lane_following_command(stop_zone_speed_limit)
                 )
 
         elif self.drive_state == "APPROACH_RED":
             if green_confirmed:
                 self.set_state("GO")
                 target_slope, raw_steering = (
-                    self.set_lane_following_command()
+                    self.set_lane_following_command(stop_zone_speed_limit)
                 )
             elif zone_ymax is None:
                 self.set_state("CRUISE")
                 target_slope, raw_steering = (
-                    self.set_lane_following_command()
+                    self.set_lane_following_command(stop_zone_speed_limit)
                 )
             elif zone_ymax >= self.stop_zone_stop_y:
                 self.set_state("STOPPED_RED")
@@ -579,14 +643,14 @@ class MotionPlanningNode(Node):
             if green_confirmed:
                 self.set_state("GO")
                 target_slope, raw_steering = (
-                    self.set_lane_following_command()
+                    self.set_lane_following_command(stop_zone_speed_limit)
                 )
             else:
                 self.stop_vehicle()
 
         elif self.drive_state == "GO":
             target_slope, raw_steering = (
-                self.set_lane_following_command()
+                self.set_lane_following_command(stop_zone_speed_limit)
             )
             if self.go_clear_elapsed():
                 self.set_state("CRUISE")
@@ -594,7 +658,7 @@ class MotionPlanningNode(Node):
         else:
             self.set_state("CRUISE")
             target_slope, raw_steering = (
-                self.set_lane_following_command()
+                self.set_lane_following_command(stop_zone_speed_limit)
             )
 
         return (
@@ -611,6 +675,7 @@ class MotionPlanningNode(Node):
         zone_ymax = self.get_stop_zone_ymax()
         red_confirmed = self.is_red_confirmed()
         green_confirmed = self.is_green_confirmed()
+        stop_zone_speed_active = self.is_stop_zone_speed_active()
 
         if (
             self.lidar_data is not None
@@ -637,6 +702,7 @@ class MotionPlanningNode(Node):
             self.get_logger().info(
                 f"state={self.drive_state}, "
                 f"zone_ymax={zone_text}, "
+                f"zone_speed_cap={stop_zone_speed_active}, "
                 f"red={red_confirmed}, green={green_confirmed}, "
                 f"heading={self.last_heading_error:.2f}, "
                 f"lateral={self.last_lateral_error:.1f}px, "
