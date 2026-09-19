@@ -28,6 +28,12 @@ def generate_launch_description():
             description='YOLO segmentation model path'
         ),
 
+        DeclareLaunchArgument(
+            'yolo_device',
+            default_value='cuda:0',
+            description='YOLO inference device: auto, cpu, or cuda:0'
+        ),
+
         # USB Camera
         Node(
             package='camera_perception_pkg',
@@ -48,8 +54,18 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'model': LaunchConfiguration('yolo_model'),
-                'device': 'cuda:0',
+                'device': LaunchConfiguration('yolo_device'),
                 'threshold': 0.3,
+            }]
+        ),
+
+        # Traffic-light classification
+        Node(
+            package='camera_perception_pkg',
+            executable='traffic_light_detector_node',
+            output='screen',
+            parameters=[{
+                'sub_image_topic': 'image_raw',
             }]
         ),
 
