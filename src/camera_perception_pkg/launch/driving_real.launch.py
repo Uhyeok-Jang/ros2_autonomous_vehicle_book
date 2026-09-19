@@ -11,7 +11,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
 
     default_model = os.path.expanduser(
-        '~/yolo/runs/segment/lane_v2_hard_aug/weights/best.pt'
+        '~/yolo/models/lane_segmentation/best.pt'
     )
 
     return LaunchDescription([
