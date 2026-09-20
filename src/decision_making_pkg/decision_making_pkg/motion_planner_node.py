@@ -17,13 +17,13 @@ SUB_LIDAR_OBSTACLE_TOPIC_NAME = "lidar_obstacle_info"
 PUB_TOPIC_NAME = "topic_control_signal"
 
 TIMER = 0.1
-MAX_STEERING = 5.0
+MAX_STEERING = 7.0
 CAR_CENTER_X = 320.0
 
 # Curve tracking controller
 # 기존에는 차량 중심 -> 먼 lookahead 점의 기울기만 사용해서 코너를 안쪽으로 자르는
 # 경향이 있었다. 이제 가까운 구간의 path tangent + lateral error를 함께 사용한다.
-KP_HEADING = 0.055
+KP_HEADING = 0.50
 KP_LATERAL = 0.030
 STEERING_DEADBAND_DEG = 1.0
 STEERING_ALPHA = 0.20
@@ -34,12 +34,16 @@ STEERING_STEP_REVERSE = 0.45
 TRACKING_FROM_END = 6
 TANGENT_SPAN = 3
 STEERING_DELAY_SEC = 0.20
+STEERING_DELAY_REARM_SEC = 0.60
+STEERING_DELAY_BYPASS_HEADING_DEG = 18.0
+STEERING_DELAY_BYPASS_LATERAL_PX = 48.0
+STOP_ZONE_BYPASS_STEERING_DELAY = True
 
 # Curve-aware speed
-DRIVING_SPEED = 200
-MEDIUM_CURVE_SPEED = 130
-SHARP_CURVE_SPEED = 95
-VERY_SHARP_CURVE_SPEED = 75
+DRIVING_SPEED = 230
+MEDIUM_CURVE_SPEED = 200
+SHARP_CURVE_SPEED = 170
+VERY_SHARP_CURVE_SPEED = 150
 APPROACH_SPEED = 70
 STOP_ZONE_SPEED = 120
 STOP_ZONE_SPEED_HOLD_SEC = 1.2
@@ -107,6 +111,29 @@ class MotionPlanningNode(Node):
         self.steering_delay_sec = float(
             self.declare_parameter(
                 'steering_delay_sec', STEERING_DELAY_SEC
+            ).value
+        )
+        self.steering_delay_rearm_sec = float(
+            self.declare_parameter(
+                'steering_delay_rearm_sec', STEERING_DELAY_REARM_SEC
+            ).value
+        )
+        self.steering_delay_bypass_heading_deg = float(
+            self.declare_parameter(
+                'steering_delay_bypass_heading_deg',
+                STEERING_DELAY_BYPASS_HEADING_DEG
+            ).value
+        )
+        self.steering_delay_bypass_lateral_px = float(
+            self.declare_parameter(
+                'steering_delay_bypass_lateral_px',
+                STEERING_DELAY_BYPASS_LATERAL_PX
+            ).value
+        )
+        self.stop_zone_bypass_steering_delay = bool(
+            self.declare_parameter(
+                'stop_zone_bypass_steering_delay',
+                STOP_ZONE_BYPASS_STEERING_DELAY
             ).value
         )
 
@@ -183,6 +210,7 @@ class MotionPlanningNode(Node):
         self.last_curve_speed = self.driving_speed
         self.last_step_limit = self.steering_step_turn_in
         self.curve_entry_time_ns = None
+        self.curve_clear_start_time_ns = None
         self.last_steering_delay_remaining = 0.0
         self.stop_zone_speed_recovery_active = False
         self.log_counter = 0
@@ -402,8 +430,19 @@ class MotionPlanningNode(Node):
 
         return self.driving_speed
 
-    def steering_delay_active(self, heading_error, lateral_error):
-        """코너를 처음 감지한 뒤 설정된 시간 동안 조향 진입을 늦춘다."""
+    def steering_delay_active(
+        self,
+        heading_error,
+        lateral_error,
+        bypass_delay=False,
+    ):
+        """Delay only a genuinely new, non-urgent curve entry.
+
+        A short straight section inside a compound curve must not re-arm the
+        delay. Sharp curves and stop zones bypass it so the vehicle never
+        receives a forced-straight command when immediate correction is
+        required.
+        """
         abs_heading = abs(heading_error)
         abs_lateral = abs(lateral_error)
         curve_detected = (
@@ -417,13 +456,38 @@ class MotionPlanningNode(Node):
 
         now_ns = self.now_ns()
 
+        urgent_curve = (
+            abs_heading >= self.steering_delay_bypass_heading_deg
+            or abs_lateral >= self.steering_delay_bypass_lateral_px
+        )
+        if bypass_delay or urgent_curve:
+            # Mark the entry delay as already elapsed. If the error drops from
+            # sharp to medium on the next frame, steering must remain active.
+            self.curve_entry_time_ns = (
+                now_ns - int(max(0.0, self.steering_delay_sec) * 1e9)
+            )
+            self.curve_clear_start_time_ns = None
+            self.last_steering_delay_remaining = 0.0
+            return False
+
         if self.curve_entry_time_ns is None:
             if not curve_detected:
                 self.last_steering_delay_remaining = 0.0
                 return False
             self.curve_entry_time_ns = now_ns
+            self.curve_clear_start_time_ns = None
+        elif curve_detected:
+            self.curve_clear_start_time_ns = None
         elif curve_cleared:
-            self.curve_entry_time_ns = None
+            if self.curve_clear_start_time_ns is None:
+                self.curve_clear_start_time_ns = now_ns
+
+            clear_elapsed_sec = (
+                now_ns - self.curve_clear_start_time_ns
+            ) / 1e9
+            if clear_elapsed_sec >= max(0.0, self.steering_delay_rearm_sec):
+                self.curve_entry_time_ns = None
+                self.curve_clear_start_time_ns = None
             self.last_steering_delay_remaining = 0.0
             return False
 
@@ -446,7 +510,15 @@ class MotionPlanningNode(Node):
             lateral_error
         )
 
-        if self.steering_delay_active(heading_error, lateral_error):
+        stop_zone_delay_bypass = (
+            self.stop_zone_bypass_steering_delay
+            and self.is_stop_zone_speed_active()
+        )
+        if self.steering_delay_active(
+            heading_error,
+            lateral_error,
+            bypass_delay=stop_zone_delay_bypass,
+        ):
             # 대기 중 조향 필터가 내부적으로 누적되어 2초 뒤 갑자기 튀지 않게 한다.
             self.filtered_steering = 0.0
             self.last_heading_error = heading_error
@@ -521,6 +593,7 @@ class MotionPlanningNode(Node):
         self.left_speed_command = 0
         self.right_speed_command = 0
         self.curve_entry_time_ns = None
+        self.curve_clear_start_time_ns = None
         self.last_steering_delay_remaining = 0.0
 
     def set_lane_following_command(self, speed_override=None):

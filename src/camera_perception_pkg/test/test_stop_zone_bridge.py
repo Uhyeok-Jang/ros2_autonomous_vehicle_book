@@ -116,6 +116,18 @@ def test_stop_zone_pixels_are_removed_from_boundary_mask():
     assert filtered[0, 0] == 255
 
 
+def test_longitudinal_boundary_survives_while_transverse_run_is_ignored():
+    node = object.__new__(Yolov8InfoExtractor)
+    boundary = np.zeros((180, 640), dtype=np.uint8)
+    boundary[:, 99:103] = 255
+    boundary[34:38, 180:560] = 255
+
+    centers = node.get_boundary_centers(boundary, target_y=40)
+
+    assert len(centers) == 1
+    assert np.isclose(centers[0], 100.5)
+
+
 def test_stop_zone_uses_lane_center_instead_of_avoiding_zone():
     node = object.__new__(Yolov8InfoExtractor)
     node.stop_zone_visible = True
@@ -141,3 +153,91 @@ def test_stop_zone_uses_lane_center_instead_of_avoiding_zone():
 
     assert target_x == 280.0
     assert mode == "stop_zone_lane_follow"
+
+
+def test_stop_zone_entry_does_not_reuse_previous_corner_path():
+    node = object.__new__(Yolov8InfoExtractor)
+    node.stop_zone_visible = True
+    node.prev_target_x = [220.0] * 7
+    node.boundary_margin_px = 24.0
+    node.max_target_step_px = 20.0
+    node.smoothing_alpha = 0.35
+    node.stop_zone_max_target_step_px = 6.0
+    node.stop_zone_smoothing_alpha = 0.18
+
+    drivable = np.zeros((180, 640), dtype=np.uint8)
+    boundaries = np.zeros_like(drivable)
+
+    target_x, _, _, mode = node.estimate_target_x(
+        drivable,
+        boundaries,
+        target_y=20,
+        target_idx=0,
+        base_x=320.0,
+    )
+
+    assert np.isclose(target_x, 221.08)
+    assert mode == "stop_zone_lane_follow"
+
+
+def test_boundary_pair_corridor_uses_center_between_dashed_and_solid():
+    center, width, mode = Yolov8InfoExtractor.choose_boundary_corridor(
+        dashed_centers=[120.0],
+        solid_centers=[320.0],
+        reference_x=220.0,
+        learned_lane_width_px=200.0,
+    )
+
+    assert center == 220.0
+    assert width == 200.0
+    assert mode == "boundary_pair"
+
+
+def test_single_boundary_uses_learned_lane_width():
+    center, width, mode = Yolov8InfoExtractor.choose_boundary_corridor(
+        dashed_centers=[120.0],
+        solid_centers=[],
+        reference_x=220.0,
+        learned_lane_width_px=200.0,
+    )
+
+    assert center == 220.0
+    assert width == 200.0
+    assert mode == "single_boundary"
+
+
+def test_boundary_corridor_rejects_large_lane_side_jump():
+    center, width, mode = Yolov8InfoExtractor.choose_boundary_corridor(
+        dashed_centers=[20.0],
+        solid_centers=[100.0],
+        reference_x=300.0,
+        learned_lane_width_px=200.0,
+    )
+
+    assert center is None
+    assert width is None
+    assert mode == "none"
+
+
+def test_stop_zone_corridor_has_priority_but_remains_rate_limited():
+    node = object.__new__(Yolov8InfoExtractor)
+    node.stop_zone_visible = True
+    node.prev_target_x = [220.0] * 7
+    node.boundary_margin_px = 24.0
+    node.max_target_step_px = 20.0
+    node.smoothing_alpha = 0.35
+    node.stop_zone_max_target_step_px = 6.0
+    node.stop_zone_smoothing_alpha = 0.18
+
+    empty = np.zeros((180, 640), dtype=np.uint8)
+    target_x, _, _, mode = node.estimate_target_x(
+        empty,
+        empty,
+        target_y=20,
+        target_idx=0,
+        base_x=100.0,
+        corridor_x=240.0,
+    )
+
+    assert np.isclose(target_x, 225.4)
+    assert mode == "stop_zone_corridor"
