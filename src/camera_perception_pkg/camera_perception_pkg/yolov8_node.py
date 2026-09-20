@@ -46,6 +46,20 @@ from interfaces_pkg.msg import DetectionArray
 from std_srvs.srv import SetBool
 
 
+def resolve_inference_device(requested_device: str) -> str:
+    """Return a usable Ultralytics device for this machine."""
+    requested_device = requested_device.strip()
+    normalized_device = requested_device.lower()
+
+    if normalized_device == "auto":
+        return "cuda:0" if cuda.is_available() else "cpu"
+
+    if normalized_device.startswith("cuda") and not cuda.is_available():
+        return "cpu"
+
+    return requested_device
+
+
 class Yolov8Node(LifecycleNode):
 
     def __init__(self, **kwargs) -> None:
@@ -57,8 +71,7 @@ class Yolov8Node(LifecycleNode):
         self.declare_parameter("model", "best.pt")
         
         # 추론 하드웨어 선택 (cpu / gpu) 
-        self.declare_parameter("device", "cpu")
-        #self.declare_parameter("device", "cuda:0")
+        self.declare_parameter("device", "cuda:0")
         #----------------------------------------------
         
         self.declare_parameter("threshold", 0.5)
@@ -74,8 +87,20 @@ class Yolov8Node(LifecycleNode):
         self.model = self.get_parameter(
             "model").get_parameter_value().string_value
 
-        self.device = self.get_parameter(
+        requested_device = self.get_parameter(
             "device").get_parameter_value().string_value
+        self.device = resolve_inference_device(requested_device)
+
+        if self.device != requested_device:
+            if requested_device.lower().startswith("cuda"):
+                self.get_logger().warning(
+                    f"CUDA device '{requested_device}' is unavailable; "
+                    "falling back to CPU"
+                )
+            else:
+                self.get_logger().info(
+                    f"Inference device selected automatically: {self.device}"
+                )
 
         self.threshold = self.get_parameter(
             "threshold").get_parameter_value().double_value
@@ -246,8 +271,6 @@ class Yolov8Node(LifecycleNode):
         return keypoints_list
 
     def image_cb(self, msg: Image) -> None:
-        print(msg.header)
-
         if self.enable:
 
             # convert image + predict
