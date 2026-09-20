@@ -23,7 +23,7 @@ CAR_CENTER_X = 320.0
 # Curve tracking controller
 # 기존에는 차량 중심 -> 먼 lookahead 점의 기울기만 사용해서 코너를 안쪽으로 자르는
 # 경향이 있었다. 이제 가까운 구간의 path tangent + lateral error를 함께 사용한다.
-KP_HEADING = 0.50
+KP_HEADING = 0.09
 KP_LATERAL = 0.030
 STEERING_DEADBAND_DEG = 1.0
 STEERING_ALPHA = 0.20
