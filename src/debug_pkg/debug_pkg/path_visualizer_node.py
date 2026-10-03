@@ -62,14 +62,18 @@ class PathVisualizerNode(Node):
             self.visualize_path()
 
     def visualize_path(self):
+        # 수신한 원본 ROI를 직접 수정하면 다음 path callback마다 이전 점이
+        # 누적되어 화면이 지직거리는 것처럼 보인다. 매번 복사본에만 그린다.
+        frame = self.roi_image.copy()
+
         # 경로 점들을 이미지 위에 그리기
         for (x, y) in self.spline_path:
             # OpenCV에서 좌표는 (x, y) 순서이므로 그대로 사용
-            cv2.circle(self.roi_image, (int(x), int(y)), 5, (0, 0, 255), -1)
+            cv2.circle(frame, (int(x), int(y)), 5, (0, 0, 255), -1)
 
         # 시각화된 이미지를 ROS 메시지로 변환하여 퍼블리시
         try:
-            output_msg = self.cv_bridge.cv2_to_imgmsg(self.roi_image, encoding='bgr8')
+            output_msg = self.cv_bridge.cv2_to_imgmsg(frame, encoding='bgr8')
             self.publisher.publish(output_msg)
         except Exception as e:
             self.get_logger().error(f"Failed to convert image for publishing: {str(e)}")

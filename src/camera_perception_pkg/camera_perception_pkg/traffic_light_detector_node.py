@@ -74,7 +74,6 @@ class TrafficLightDetector(Node):
                 # Publish traffic light color as string
                 color_msg = String()
                 color_msg.data = traffic_light_color
-                print(f'traffic light: {color_msg.data}') 
                 self.publisher.publish(color_msg)
                 traffic_light_detected = True
                 break  # Only process the first detected traffic light
@@ -83,7 +82,6 @@ class TrafficLightDetector(Node):
             # Publish 'None' if no traffic light is detected
             color_msg = String()
             color_msg.data = 'None'
-            print(f'traffic light: {color_msg.data}')
             self.publisher.publish(color_msg)
 
 
