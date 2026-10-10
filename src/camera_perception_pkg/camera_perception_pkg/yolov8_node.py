@@ -46,20 +46,6 @@ from interfaces_pkg.msg import DetectionArray
 from std_srvs.srv import SetBool
 
 
-def resolve_inference_device(requested_device: str) -> str:
-    """Return a usable Ultralytics device for this machine."""
-    requested_device = requested_device.strip()
-    normalized_device = requested_device.lower()
-
-    if normalized_device == "auto":
-        return "cuda:0" if cuda.is_available() else "cpu"
-
-    if normalized_device.startswith("cuda") and not cuda.is_available():
-        return "cpu"
-
-    return requested_device
-
-
 class Yolov8Node(LifecycleNode):
 
     def __init__(self, **kwargs) -> None:
@@ -71,10 +57,13 @@ class Yolov8Node(LifecycleNode):
         self.declare_parameter("model", "best.pt")
         
         # 추론 하드웨어 선택 (cpu / gpu) 
-        self.declare_parameter("device", "cuda:0")
+        self.declare_parameter("device", "cpu")
+        #self.declare_parameter("device", "cuda:0")
         #----------------------------------------------
         
         self.declare_parameter("threshold", 0.5)
+        # Negative means use the common threshold; only real launch lowers lane2.
+        self.declare_parameter("lane_threshold", -1.0)
         self.declare_parameter("enable", True)
         self.declare_parameter("image_reliability",
                                QoSReliabilityPolicy.RELIABLE)
@@ -87,23 +76,13 @@ class Yolov8Node(LifecycleNode):
         self.model = self.get_parameter(
             "model").get_parameter_value().string_value
 
-        requested_device = self.get_parameter(
+        self.device = self.get_parameter(
             "device").get_parameter_value().string_value
-        self.device = resolve_inference_device(requested_device)
-
-        if self.device != requested_device:
-            if requested_device.lower().startswith("cuda"):
-                self.get_logger().warning(
-                    f"CUDA device '{requested_device}' is unavailable; "
-                    "falling back to CPU"
-                )
-            else:
-                self.get_logger().info(
-                    f"Inference device selected automatically: {self.device}"
-                )
 
         self.threshold = self.get_parameter(
             "threshold").get_parameter_value().double_value
+        lane_threshold = self.get_parameter('lane_threshold').value
+        self.lane_threshold = self.threshold if lane_threshold < 0 else float(lane_threshold)
 
         self.enable = self.get_parameter(
             "enable").get_parameter_value().bool_value
@@ -148,7 +127,7 @@ class Yolov8Node(LifecycleNode):
         # subs
         self._sub = self.create_subscription(
             Image,
-            "image_raw",
+            "camera/image_raw",
             self.image_cb,
             self.image_qos_profile
         )
@@ -271,6 +250,8 @@ class Yolov8Node(LifecycleNode):
         return keypoints_list
 
     def image_cb(self, msg: Image) -> None:
+        print(msg.header)
+
         if self.enable:
 
             # convert image + predict
@@ -279,10 +260,20 @@ class Yolov8Node(LifecycleNode):
                 source=cv_image,
                 verbose=False,
                 stream=False,
-                conf=self.threshold,
+                conf=min(self.threshold, self.lane_threshold),
                 device=self.device
             )
             results: Results = results[0].cpu()
+            if results.boxes is not None:
+                keep = [
+                    i for i, box in enumerate(results.boxes)
+                    if float(box.conf) >= (
+                        self.lane_threshold
+                        if self.yolo.names[int(box.cls)] == 'lane2' else self.threshold
+                    )
+                ]
+                # Slice masks and boxes together, preserving their association.
+                results = results[keep]
 
             if results.boxes:
                 hypothesis = self.parse_hypothesis(results)
@@ -327,8 +318,12 @@ class Yolov8Node(LifecycleNode):
 def main():
     rclpy.init()
     node = Yolov8Node()
-    node.trigger_configure()
-    node.trigger_activate()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        node.trigger_configure()
+        node.trigger_activate()
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()

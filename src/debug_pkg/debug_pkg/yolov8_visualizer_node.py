@@ -70,7 +70,7 @@ class Yolov8VisualizerNode(LifecycleNode):
         )
 
         # pubs
-        self._dbg_pub = self.create_publisher(Image, "yolov8_visualized_img", 10)
+        self._dbg_pub = self.create_publisher(Image, "dbg_image", 10)
         self._bb_markers_pub = self.create_publisher(
             MarkerArray, "dgb_bb_markers", 10)
         self._kp_markers_pub = self.create_publisher(
@@ -83,7 +83,7 @@ class Yolov8VisualizerNode(LifecycleNode):
 
         # subs
         self.image_sub = message_filters.Subscriber(
-            self, Image, "image_raw", qos_profile=self.image_qos_profile)
+            self, Image, "camera/image_raw", qos_profile=self.image_qos_profile)
         self.detections_sub = message_filters.Subscriber(
             self, DetectionArray, "detections", qos_profile=10)
 
@@ -294,8 +294,12 @@ class Yolov8VisualizerNode(LifecycleNode):
 def main():
     rclpy.init()
     node = Yolov8VisualizerNode()
-    node.trigger_configure()
-    node.trigger_activate()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        node.trigger_configure()
+        node.trigger_activate()
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()

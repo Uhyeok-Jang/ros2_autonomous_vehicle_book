@@ -74,7 +74,7 @@ class ImagePublisherNode(Node):
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             if not self.cap.isOpened():
                 self.get_logger().error('Cannot open video file: %s' % self.video_path)
-                rclpy.shutdown()
+                rclpy.try_shutdown()
                 sys.exit(1)
         elif self.data_source == 'image':
             if os.path.isdir(self.img_dir):
@@ -82,11 +82,11 @@ class ImagePublisherNode(Node):
                 self.img_num = 0
             else:
                 self.get_logger().error('Not a directory file: %s' % self.img_dir)
-                rclpy.shutdown()
+                rclpy.try_shutdown()
                 sys.exit(1)
         else:
             self.get_logger().error("Wrong data source: %s \nCheck that the DATA_SOURCE variable is either 'camera', 'image', or 'video'." % self.data_source)
-            rclpy.shutdown()
+            rclpy.try_shutdown()
             sys.exit(1)
         self.publisher = self.create_publisher(Image, self.pub_topic, self.qos_profile)
         self.timer = self.create_timer(self.timer_period, self.timer_callback)
@@ -96,11 +96,11 @@ class ImagePublisherNode(Node):
             ret, frame = self.cap.read()
             if ret:
                 frame = cv2.resize(frame, (640, 480))
-                image_msg = self.br.cv2_to_imgmsg(frame)
+                image_msg = self.br.cv2_to_imgmsg(frame, encoding='bgr8')
                 image_msg.header = Header()
                 image_msg.header.stamp = self.get_clock().now().to_msg()
                 image_msg.header.frame_id = 'image_frame' 
-                self.publisher.publish(self.br.cv2_to_imgmsg(frame))
+                self.publisher.publish(image_msg)
                 if self.logger:
                     cv2.imshow('Camera Image', frame)
                     cv2.waitKey(1)
@@ -113,11 +113,11 @@ class ImagePublisherNode(Node):
                     self.get_logger().warn('Skipping non-image file: %s' % img_file)
                 else:
                     img = cv2.resize(img, (640, 480))
-                    image_msg = self.br.cv2_to_imgmsg(img)
+                    image_msg = self.br.cv2_to_imgmsg(img, encoding='bgr8')
                     image_msg.header = Header()
                     image_msg.header.stamp = self.get_clock().now().to_msg()
                     image_msg.header.frame_id = 'image_frame'
-                    self.publisher.publish(self.br.cv2_to_imgmsg(img))
+                    self.publisher.publish(image_msg)
                     if self.logger:
                         self.get_logger().info('Published image: %s' % img_file)
                         cv2.imshow('Saved Image', img)
@@ -131,7 +131,7 @@ class ImagePublisherNode(Node):
             ret, img = self.cap.read()
             if ret:
                 img = cv2.resize(img, (640, 480))
-                image_msg = self.br.cv2_to_imgmsg(img)
+                image_msg = self.br.cv2_to_imgmsg(img, encoding='bgr8')
                 image_msg.header = Header()
                 image_msg.header.stamp = self.get_clock().now().to_msg()
                 image_msg.header.frame_id = 'image_frame'
@@ -155,7 +155,7 @@ def main(args=None):
     if node.cap.isOpened():
         node.cap.release()
     cv2.destroyAllWindows()
-    rclpy.shutdown()
+    rclpy.try_shutdown()
   
 if __name__ == '__main__':
     main()

@@ -1,4 +1,6 @@
 // 최대 입력 문자 수
+#include <stdlib.h>
+
 const unsigned int MAX_INPUT = 15;
 
 // 핀 번호 변수
@@ -14,8 +16,8 @@ const int POT = A2;
 const int STEERING_SPEED = 128;
 
 // 가변저항 값 범위
-const int resistance_most_left = 143;
-const int resistance_most_right = 68;
+const int resistance_most_left = 152;
+const int resistance_most_right = 64;
 
 // 조향 최대 단계 수 (한 쪽 기준)
 const int MAX_STEERING_STEP = 7;
@@ -27,6 +29,9 @@ int left_speed = 0, right_speed = 0;
 // 명령 주기 제한 변수
 unsigned long lastCommandTime = 0; // 마지막 명령 처리 시간
 const unsigned int COMMAND_INTERVAL = 50; // 명령 처리 간 최소 대기 시간(ms)
+// Only discard interrupted input fragments; this does NOT stop motor outputs.
+const unsigned long INPUT_FRAGMENT_TIMEOUT_MS = 500;
+bool commandActive = false;
 
 // 함수 선언
 void steerRight();
@@ -36,6 +41,8 @@ void setLeftMotorSpeed(int speed);
 void setRightMotorSpeed(int speed);
 void processIncomingByte(const byte inByte);
 void processData(const char *data);
+void stopVehicle();
+bool parseField(const char *&cursor, char marker, long &value);
 
 void setup() {
     Serial.begin(9600);
@@ -48,6 +55,7 @@ void setup() {
     pinMode(FORWARD_RIGHT_2, OUTPUT);
     pinMode(FORWARD_LEFT_1, OUTPUT);
     pinMode(FORWARD_LEFT_2, OUTPUT);
+    stopVehicle(); // Remain disarmed until a complete valid command arrives.
 }
 
 void loop() {
@@ -57,6 +65,14 @@ void loop() {
     // 직렬 데이터 처리
     while (Serial.available() > 0) {
         processIncomingByte(Serial.read());
+    }
+
+    currentTime = millis();
+    // Remain stopped at startup or after an explicit zero command.
+    // No automatic motor cutoff when command reception pauses.
+    if (!commandActive) {
+        stopVehicle();
+        return;
     }
 
     // 일정 시간 간격으로만 제어 명령 실행
@@ -81,6 +97,16 @@ void loop() {
         // 마지막 명령 시간 갱신
         lastCommandTime = currentTime;
     }
+}
+
+void stopVehicle() {
+    commandActive = false;
+    angle = 0;
+    left_speed = 0;
+    right_speed = 0;
+    setLeftMotorSpeed(0);
+    setRightMotorSpeed(0);
+    maintainSteering(); // Disable steering output too; do not recenter on a stop.
 }
 
 // 조향 제어 함수
@@ -124,12 +150,21 @@ void setRightMotorSpeed(int speed) {
 void processIncomingByte(const byte inByte) {
     static char input_line[MAX_INPUT];
     static unsigned int input_pos = 0;
+    static bool input_overflow = false;
+    static unsigned long lastByteTime = 0;
+    const unsigned long now = millis();
+    if (now - lastByteTime >= INPUT_FRAGMENT_TIMEOUT_MS) {
+        input_pos = 0; // Do not later accept an old, interrupted partial packet.
+        input_overflow = false;
+    }
+    lastByteTime = now;
 
     switch (inByte) {
         case '\n':
             input_line[input_pos] = 0; // 종료 문자 추가
-            processData(input_line);  // 데이터 처리
+            if (!input_overflow) processData(input_line);
             input_pos = 0; // 버퍼 초기화
+            input_overflow = false;
             break;
 
         case '\r':
@@ -138,36 +173,39 @@ void processIncomingByte(const byte inByte) {
         default:
             if (input_pos < (MAX_INPUT - 1)) {
                 input_line[input_pos++] = inByte;
+            } else {
+                input_overflow = true; // Discard the WHOLE oversized frame.
             }
             break;
     }
 }
 
-// 데이터 패킷 처리
+bool parseField(const char *&cursor, char marker, long &value) {
+    if (*cursor != marker) return false;
+    ++cursor;
+    const char *digits = cursor;
+    if (*digits == '-' || *digits == '+') ++digits;
+    if (*digits < '0' || *digits > '9') return false;
+    char *end = NULL;
+    value = strtol(cursor, &end, 10);
+    cursor = end;
+    return true;
+}
+
+// Only complete, in-range s...l...r... packets update the command.
 void processData(const char *data) {
-    int sIndex = -1, lIndex = -1, rIndex = -1;
+    const char *cursor = data;
+    long newAngle, newLeftSpeed, newRightSpeed;
+    if (!parseField(cursor, 's', newAngle)
+        || !parseField(cursor, 'l', newLeftSpeed)
+        || !parseField(cursor, 'r', newRightSpeed) || *cursor != '\0') return;
+    if (newAngle < -MAX_STEERING_STEP || newAngle > MAX_STEERING_STEP
+        || newLeftSpeed < -255 || newLeftSpeed > 255
+        || newRightSpeed < -255 || newRightSpeed > 255) return;
 
-    // 명령 파싱
-    for (int i = 0; data[i] != '\0'; i++) {
-        if (data[i] == 's') sIndex = i;
-        else if (data[i] == 'l') lIndex = i;
-        else if (data[i] == 'r') rIndex = i;
-    }
-
-    if (sIndex != -1 && lIndex != -1 && rIndex != -1) {
-        int newAngle = atoi(data + sIndex + 1);
-        int newLeftSpeed = atoi(data + lIndex + 1);
-        int newRightSpeed = atoi(data + rIndex + 1);
-
-        // 명령 값 업데이트 (중복 명령 무시)
-        if (newAngle != angle || newLeftSpeed != left_speed || newRightSpeed != right_speed) {
-            angle = newAngle;
-            left_speed = newLeftSpeed;
-            right_speed = newRightSpeed;
-
-            // 조향 값 제한
-            if (angle > MAX_STEERING_STEP) angle = MAX_STEERING_STEP;
-            else if (angle < -MAX_STEERING_STEP) angle = -MAX_STEERING_STEP;
-        }
-    }
+    angle = (int)newAngle;
+    left_speed = (int)newLeftSpeed;
+    right_speed = (int)newRightSpeed;
+    commandActive = angle != 0 || left_speed != 0 || right_speed != 0;
+    if (!commandActive) stopVehicle(); // s0l0r0 stops all outputs immediately.
 }

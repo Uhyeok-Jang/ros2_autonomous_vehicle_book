@@ -30,7 +30,6 @@ class PathPlannerNode(Node):
         )
 
         self.target_points = []
-        self.plan_count = 0
 
         self.lane_sub = self.create_subscription(
             LaneInfo,
@@ -38,6 +37,7 @@ class PathPlannerNode(Node):
             self.lane_callback,
             self.qos_profile
         )
+
         self.publisher = self.create_publisher(
             PathPlanningResult,
             self.pub_topic,
@@ -46,6 +46,7 @@ class PathPlannerNode(Node):
 
     def lane_callback(self, msg: LaneInfo):
         self.target_points = msg.target_points
+
         if len(self.target_points) >= 3:
             self.plan_path()
 
@@ -58,7 +59,7 @@ class PathPlannerNode(Node):
             (tp.target_x, tp.target_y) for tp in self.target_points
         ])
 
-        # 차량 앞 범퍼 중심을 마지막 anchor로 추가한다.
+        # 차량 앞 범퍼 중심점을 마지막 anchor로 추가한다.
         y_points_list = list(y_points)
         x_points_list = list(x_points)
         y_points_list.append(self.car_center_point[1])
@@ -73,9 +74,8 @@ class PathPlannerNode(Node):
         y_points = np.asarray(y_points, dtype=float)
         x_points = np.asarray(x_points, dtype=float)
 
-        # CubicSpline은 소수의 noisy anchor에서 overshoot할 수 있다.
-        # lane-following에서는 shape-preserving한 선형 보간을 사용해
-        # target point 사이에서 경로가 튀는 현상을 막는다.
+        # CubicSpline은 소수의 noisy point 사이에서 overshoot할 수 있다.
+        # lane following에서는 보수적인 선형 보간이 더 안정적이므로 np.interp를 사용한다.
         y_new = np.linspace(float(y_points.min()), float(y_points.max()), 100)
         x_new = np.interp(y_new, y_points, x_points)
 
@@ -84,13 +84,11 @@ class PathPlannerNode(Node):
         path_msg.y_points = y_new.tolist()
         self.publisher.publish(path_msg)
 
-        self.plan_count += 1
-        if self.plan_count % 30 == 0:
-            self.get_logger().info(
-                "anchors=" + ", ".join(
-                    f"({x:.1f},{y:.1f})" for x, y in zip(x_points, y_points)
-                )
+        self.get_logger().info(
+            "anchors=" + ", ".join(
+                f"({x:.1f},{y:.1f})" for x, y in zip(x_points, y_points)
             )
+        )
 
         self.target_points.clear()
 
@@ -104,7 +102,7 @@ def main(args=None):
         print("\n\nshutdown\n\n")
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
 if __name__ == '__main__':

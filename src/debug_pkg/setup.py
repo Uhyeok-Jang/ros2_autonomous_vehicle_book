@@ -20,6 +20,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'lane_tracking_visualizer_node = debug_pkg.lane_tracking_visualizer_node:main',
             'path_visualizer_node = debug_pkg.path_visualizer_node:main',	
             'yolov8_visualizer_node = debug_pkg.yolov8_visualizer_node:main',	
         ],

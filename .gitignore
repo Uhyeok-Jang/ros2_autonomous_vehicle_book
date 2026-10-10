@@ -1,0 +1,13 @@
+# Local build outputs and generated caches.
+/build/
+/install/
+/log/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.vscode/
+
+# Local recordings and session notes; existing tracked samples stay tracked.
+**/Collected_Datasets/
+/SESSION_HANDOFF_*.md
+/SIMULATION_HANDOFF_*.md
