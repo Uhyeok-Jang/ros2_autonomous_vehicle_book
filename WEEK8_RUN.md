@@ -16,7 +16,7 @@ The runner selects this workspace without the other workspace's overlay.
 
 The launch is `src/camera_perception_pkg/launch/driving_real.launch.py`. It uses USB camera 2 by default and the serial sender uses `/dev/ttyACM0` at 9600 baud. The Arduino source snapshot is `src/control/driving/driving.ino`; committing this file does not upload it to the board.
 
-The model defaults to `~/yolo/models/lane_segmentation/best.pt`, which is outside this repository and must be supplied separately. Override the path without editing the controller:
+A copy of the current weights is stored at `model/best.pt`. This storage copy is not wired into the launch yet: the default still points to `~/yolo/models/lane_segmentation/best.pt` outside the repository. Override the path without editing the controller:
 
 ```bash
 ./run_driving_real.sh yolo_model:=/absolute/path/to/best.pt
