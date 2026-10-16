@@ -16,6 +16,7 @@ def test_lane_center_smoothing_and_missing_band_retention():
     node = object.__new__(Yolov8InfoExtractor)
     node.prev_target_x = [None] * 3
     node.smoothing_alpha = .4
+    node.lane_target_ratio = .5
     roi = np.zeros((180, 640), dtype=np.uint8)
     roi[:, 200:301] = 255
     assert node.estimate_target_x(roi, 55, 1) == pytest.approx(250)

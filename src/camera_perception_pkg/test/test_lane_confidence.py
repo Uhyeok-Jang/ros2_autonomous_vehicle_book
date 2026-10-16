@@ -8,9 +8,10 @@ from ultralytics.engine.results import Results
 from camera_perception_pkg.yolov8_node import Yolov8Node
 
 
-def run_callback(scores):
+def run_callback(scores, encoding='bgr8'):
     names = {0: 'lane2', 1: 'traffic_light', 2: 'dashed_line'}
     frame = np.zeros((80, 100, 3), dtype=np.uint8)
+    frame[:] = [17, 89, 203]
     boxes = np.array([[10+i*15, 10, 20+i*15, 50, score, cls]
                       for i, (score, cls) in enumerate(scores)], dtype=np.float32)
     masks = np.zeros((len(scores), 80, 100), dtype=np.float32)
@@ -25,7 +26,8 @@ def run_callback(scores):
     node.yolo = SimpleNamespace(names=names, predict=lambda **kwargs: (calls.append(kwargs) or [results]))
     node.cv_bridge = CvBridge()
     node._pub = SimpleNamespace(publish=outputs.append)
-    image = node.cv_bridge.cv2_to_imgmsg(frame, encoding='bgr8')
+    camera_frame = frame[..., ::-1].copy() if encoding == 'rgb8' else frame
+    image = node.cv_bridge.cv2_to_imgmsg(camera_frame, encoding=encoding)
     image.header.frame_id = 'camera_frame'
     node.image_cb(image)
     return outputs[0], calls[0]
@@ -34,6 +36,7 @@ def run_callback(scores):
 def test_lane_threshold_preserves_box_mask_alignment_and_other_object_threshold():
     msg, inference = run_callback([(.18, 0), (.19, 1), (.91, 2), (.14, 0)])
     assert inference['conf'] == .15
+    assert inference['half'] is False
     assert [d.class_name for d in msg.detections] == ['lane2', 'dashed_line']
     assert msg.header.frame_id == 'camera_frame'
     first_x = min(p.x for p in msg.detections[0].mask.data)
@@ -44,3 +47,10 @@ def test_lane_threshold_preserves_box_mask_alignment_and_other_object_threshold(
 def test_all_filtered_detections_publish_an_empty_message():
     msg, _ = run_callback([(.14, 0), (.19, 1)])
     assert msg.detections == []
+
+
+def test_rgb_gazebo_frames_and_bgr_frames_reach_yolo_in_the_same_color_order():
+    _, rgb = run_callback([(.9, 0)], 'rgb8')
+    _, bgr = run_callback([(.9, 0)], 'bgr8')
+    assert np.array_equal(rgb['source'], bgr['source'])
+    assert rgb['source'][0, 0].tolist() == [17, 89, 203]

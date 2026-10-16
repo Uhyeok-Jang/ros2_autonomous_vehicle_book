@@ -16,10 +16,11 @@ const int POT = A2;
 const int STEERING_SPEED = 128;
 
 // 가변저항 값 범위
-const int resistance_most_left = 152;
-const int resistance_most_right = 64;
+const int resistance_most_left = 158;
+const int resistance_most_right = 76;
 
 // 조향 최대 단계 수 (한 쪽 기준)
+// 명령 주기 제한 변수
 const int MAX_STEERING_STEP = 7;
 
 // 제어 상태 변수

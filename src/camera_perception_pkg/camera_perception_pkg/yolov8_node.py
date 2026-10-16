@@ -250,16 +250,16 @@ class Yolov8Node(LifecycleNode):
         return keypoints_list
 
     def image_cb(self, msg: Image) -> None:
-        print(msg.header)
-
         if self.enable:
 
             # convert image + predict
-            cv_image = self.cv_bridge.imgmsg_to_cv2(msg)
+            # Normalize ROS RGB/BGR camera images to Ultralytics' OpenCV input.
+            cv_image = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             results = self.yolo.predict(
                 source=cv_image,
                 verbose=False,
                 stream=False,
+                half=False,
                 conf=min(self.threshold, self.lane_threshold),
                 device=self.device
             )

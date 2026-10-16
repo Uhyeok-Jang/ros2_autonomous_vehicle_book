@@ -16,6 +16,7 @@ def controller(monkeypatch):
     node.lane_detected = None
     node.last_detection_time = node.last_valid_path_time = None
     node.detection_data = node.traffic_light_data = node.lidar_data = None
+    node.stop_reason = node.stop_started_time = None
     node.steering_command = node.left_speed_command = node.right_speed_command = 0
     node.filtered_steering = 0.
     node.kp_heading, node.steering_alpha = .09, .30
@@ -23,7 +24,7 @@ def controller(monkeypatch):
     node.lane_loss_speed, node.lane_detection_timeout = 140, .5
     outputs = []
     node.publisher = SimpleNamespace(publish=outputs.append)
-    node.get_logger = lambda: SimpleNamespace(info=lambda _: None)
+    node.get_logger = lambda: SimpleNamespace(info=lambda _: None, warning=lambda _: None)
     return node, outputs
 
 
@@ -92,7 +93,7 @@ def test_obstacle_still_prevents_driving_after_camera_is_ready(controller):
     assert outputs[-1].left_speed == 230
 
 
-def test_red_light_still_prevents_driving_after_camera_is_ready(controller):
+def test_disabled_red_light_stop_keeps_driving_after_camera_is_ready(controller):
     node, outputs = controller
     signal = Detection(class_name='traffic_light')
     signal.bbox.center.position.y, signal.bbox.size.y = 100., 20.
@@ -100,4 +101,5 @@ def test_red_light_still_prevents_driving_after_camera_is_ready(controller):
     node.traffic_light_callback(String(data='Red'))
     node.path_callback(valid_path())
     node.timer_callback()
-    assert outputs[-1].left_speed == 0
+    # The validated real configuration leaves should_stop=True commented out.
+    assert outputs[-1].left_speed == outputs[-1].right_speed == node.lane_loss_speed

@@ -77,6 +77,8 @@ class MotionPlanningNode(Node):
         self.startup_ready = False
         self.traffic_light_data = None
         self.lidar_data = None
+        self.stop_reason = None
+        self.stop_started_time = None
 
         self.steering_command = 0
         self.left_speed_command = 0
@@ -188,15 +190,52 @@ class MotionPlanningNode(Node):
         speed = min(normal_speed, max(0, min(255, self.lane_loss_speed))) if lane_lost else normal_speed
         return speed, lane_lost
 
+    def log_stop_transition(self, reason, detail=''):
+        """Record stop causes and duration only when the stop state changes."""
+        if reason == self.stop_reason:
+            return
+
+        now = time.monotonic()
+        if self.stop_reason is not None:
+            self.get_logger().info(
+                f'STOP_END reason={self.stop_reason}, '
+                f'duration={now - self.stop_started_time:.3f}s, '
+                f'next_reason={reason or "none"}, '
+                f'left_speed={self.left_speed_command}, right_speed={self.right_speed_command}'
+            )
+
+        self.stop_reason = reason
+        self.stop_started_time = now if reason is not None else None
+        if reason is not None:
+            traffic_light = (self.traffic_light_data.data
+                             if self.traffic_light_data is not None else None)
+            lidar_obstacle = self.lidar_data.data if self.lidar_data is not None else None
+            message = (
+                f'STOP reason={reason}, lane_detected={self.lane_detected}, '
+                f'traffic_light={traffic_light}, lidar_obstacle={lidar_obstacle}, '
+                f'driving_speed={self.driving_speed}, lane_loss_speed={self.lane_loss_speed}'
+            )
+            if detail:
+                message += f', {detail}'
+            logger = self.get_logger()
+            if reason == 'startup_wait':
+                logger.info(message)
+            else:
+                logger.warning(message)
+
     def timer_callback(self):
         target_slope = 0.0
         raw_steering = 0.0
         speed, lane_lost = self.tracking_speed()
+        stop_reason = None
+        stop_detail = ''
 
         if not self.startup_ready:
+            stop_reason = 'startup_wait'
             self.stop_vehicle()
 
         elif self.lidar_data is not None and self.lidar_data.data is True:
+            stop_reason = 'lidar_obstacle'
             self.stop_vehicle()
 
         elif self.traffic_light_data is not None and self.traffic_light_data.data == 'Red':
@@ -211,10 +250,12 @@ class MotionPlanningNode(Node):
                         )
 
                         if y_max < 150:
-                            should_stop = True
+                            # hould_stop = True
                             break
 
             if should_stop:
+                stop_reason = 'red_traffic_light'
+                stop_detail = f'traffic_light_y_max={y_max}, stop_threshold=150'
                 self.stop_vehicle()
             else:
                 self.steering_command, target_slope, raw_steering = self.calculate_stable_steering()
@@ -225,6 +266,11 @@ class MotionPlanningNode(Node):
             self.steering_command, target_slope, raw_steering = self.calculate_stable_steering()
             self.left_speed_command = speed
             self.right_speed_command = speed
+
+        if stop_reason is None and self.left_speed_command == self.right_speed_command == 0:
+            stop_reason = ('driving_speed_zero' if self.driving_speed <= 0
+                           else 'lane_loss_speed_zero')
+        self.log_stop_transition(stop_reason, stop_detail)
 
         self.get_logger().info(
             f"slope={target_slope:.2f}, raw_steer={raw_steering:.2f}, "

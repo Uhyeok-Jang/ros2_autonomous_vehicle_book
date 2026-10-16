@@ -30,6 +30,7 @@ TARGET_Y_VALUES = (5, 55, 105)
 TARGET_BAND_THICKNESS = 10
 MIN_LANE_PIXELS = 20
 SMOOTHING_ALPHA = 0.4
+LANE_TARGET_RATIO = 0.5  # 0=left boundary, 0.5=center, 1=right boundary
 #----------------------------------------------
 
 
@@ -42,9 +43,14 @@ class Yolov8InfoExtractor(Node):
         self.show_image = self.declare_parameter('show_image', SHOW_IMAGE).value
         self.lane_class_name = self.declare_parameter('lane_class_name', LANE_CLASS_NAME).value
         self.smoothing_alpha = float(self.declare_parameter('smoothing_alpha', SMOOTHING_ALPHA).value)
+        self.lane_target_ratio = float(self.declare_parameter(
+            'lane_target_ratio', LANE_TARGET_RATIO).value)
+        if not np.isfinite(self.lane_target_ratio) or not 0.0 <= self.lane_target_ratio <= 1.0:
+            raise ValueError('lane_target_ratio must be a finite value between 0.0 and 1.0')
 
         self.cv_bridge = CvBridge()
         self.prev_target_x = [None] * len(TARGET_Y_VALUES)
+        self.last_mask_shape = (480, 640)
 
         # QoS settings
         self.qos_profile = QoSProfile(
@@ -62,6 +68,9 @@ class Yolov8InfoExtractor(Node):
         )
         self.publisher = self.create_publisher(LaneInfo, self.pub_topic, self.qos_profile)
         self.roi_image_publisher = self.create_publisher(Image, ROI_IMAGE_TOPIC_NAME, self.qos_profile)
+        self.get_logger().info(
+            f'lane_target_ratio={self.lane_target_ratio:.2f} '
+            '(0.5=center, larger values move the target right)')
 
     def build_lane_mask(self, detection_msg: DetectionArray):
         """YOLO segmentation의 lane2 polygon을 채운 binary mask로 변환한다."""
@@ -89,7 +98,7 @@ class Yolov8InfoExtractor(Node):
         return lane_mask
 
     def estimate_target_x(self, roi_image, target_y, target_idx):
-        """해당 높이의 lane2 영역 중앙을 구하고 이전 프레임과 EMA smoothing한다."""
+        """lane2 좌우 경계 사이의 목표 위치를 구하고 EMA smoothing한다."""
         h, w = roi_image.shape[:2]
         half = TARGET_BAND_THICKNESS // 2
         upper = max(0, target_y - half)
@@ -100,7 +109,7 @@ class Yolov8InfoExtractor(Node):
         if detected_x.size >= MIN_LANE_PIXELS:
             # 극단 outlier에 덜 민감하도록 5~95 percentile 경계를 사용한다.
             left_x, right_x = np.percentile(detected_x, [5, 95])
-            measured_x = float((left_x + right_x) / 2.0)
+            measured_x = float(left_x + self.lane_target_ratio * (right_x - left_x))
 
             previous_x = self.prev_target_x[target_idx]
             if previous_x is None:
@@ -118,16 +127,44 @@ class Yolov8InfoExtractor(Node):
         self.prev_target_x[target_idx] = smoothed_x
         return smoothed_x
 
-    def yolov8_detections_callback(self, detection_msg: DetectionArray):
-        if len(detection_msg.detections) == 0:
-            return
+    def update_roi_view(self, mask, bird, roi, points, header, missing=False):
+        """Refresh only image outputs; an absent lane never creates a target."""
+        if self.show_image:
+            debug_roi = cv2.cvtColor(roi, cv2.COLOR_GRAY2BGR)
+            for point in points:
+                cv2.circle(debug_roi, (int(point.target_x), int(point.target_y)),
+                           5, (0, 0, 255), -1)
+            cv2.line(debug_roi, (roi.shape[1] // 2, 0),
+                     (roi.shape[1] // 2, roi.shape[0] - 1), (0, 255, 0), 1)
+            if missing:
+                cv2.putText(debug_roi, 'NO LANE2 DETECTED', (12, 28),
+                            cv2.FONT_HERSHEY_SIMPLEX, .65, (0, 0, 255), 2)
+            cv2.imshow('lane2_mask_image', mask)
+            cv2.imshow('lane2_bird_img', bird)
+            cv2.imshow('roi_img', debug_roi)
+            cv2.waitKey(1)
+        try:
+            image = self.cv_bridge.cv2_to_imgmsg(roi, encoding='mono8')
+            image.header = header
+            self.roi_image_publisher.publish(image)
+        except Exception as exc:
+            self.get_logger().error(f'Failed to convert and publish ROI image: {exc}')
 
+    def show_missing_lane(self, detection_msg):
+        mask = np.zeros(self.last_mask_shape, dtype=np.uint8)
+        roi = mask[min(300, mask.shape[0] - 1):, :]
+        self.update_roi_view(mask, mask, roi, [], detection_msg.header, missing=True)
+        self.get_logger().warning(
+            f"No valid '{self.lane_class_name}' mask detected", throttle_duration_sec=1.0)
+
+    def yolov8_detections_callback(self, detection_msg: DetectionArray):
         lane2_mask_image = self.build_lane_mask(detection_msg)
         if lane2_mask_image is None or cv2.countNonZero(lane2_mask_image) == 0:
-            self.get_logger().warning(f"No valid '{self.lane_class_name}' mask detected")
+            self.show_missing_lane(detection_msg)
             return
 
         h, w = lane2_mask_image.shape[:2]
+        self.last_mask_shape = (h, w)
         dst_mat = [
             [round(w * 0.3), round(h * 0.0)],
             [round(w * 0.7), round(h * 0.0)],
@@ -165,28 +202,8 @@ class Yolov8InfoExtractor(Node):
         else:
             grad = 0.0
 
-        if self.show_image:
-            debug_roi = cv2.cvtColor(roi_image, cv2.COLOR_GRAY2BGR)
-            for point in target_points:
-                cv2.circle(
-                    debug_roi,
-                    (int(point.target_x), int(point.target_y)),
-                    5,
-                    (0, 0, 255),
-                    -1
-                )
-            cv2.line(debug_roi, (w // 2, 0), (w // 2, debug_roi.shape[0] - 1), (0, 255, 0), 1)
-
-            cv2.imshow('lane2_mask_image', lane2_mask_image)
-            cv2.imshow('lane2_bird_img', lane2_bird_image)
-            cv2.imshow('roi_img', debug_roi)
-            cv2.waitKey(1)
-
-        try:
-            roi_image_msg = self.cv_bridge.cv2_to_imgmsg(roi_image, encoding="mono8")
-            self.roi_image_publisher.publish(roi_image_msg)
-        except Exception as e:
-            self.get_logger().error(f"Failed to convert and publish ROI image: {e}")
+        self.update_roi_view(lane2_mask_image, lane2_bird_image, roi_image,
+                             target_points, detection_msg.header)
 
         lane = LaneInfo()
         lane.slope = grad
@@ -195,7 +212,7 @@ class Yolov8InfoExtractor(Node):
 
         self.get_logger().info(
             "target_x=" + ", ".join(f"{x:.1f}" for x in target_x_values) +
-            f", slope={grad:.2f}"
+            f", slope={grad:.2f}", throttle_duration_sec=1.0
         )
 
 

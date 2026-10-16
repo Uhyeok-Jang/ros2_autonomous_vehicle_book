@@ -1,5 +1,5 @@
-"""Reduced PWM on lane loss must retain steering and obey stop conditions."""
 import pytest
+"""Reduced PWM on lane loss must retain steering and obey stop conditions."""
 from interfaces_pkg.msg import Detection, DetectionArray, Point2D
 from std_msgs.msg import Bool, String
 
@@ -67,7 +67,7 @@ def test_reduced_speed_is_configurable_and_never_exceeds_normal_pwm(controller, 
     assert outputs[-1].left_speed == outputs[-1].right_speed == expected
 
 
-def test_lidar_and_red_light_override_lane_loss_speed(controller):
+def test_lidar_stops_but_disabled_red_light_stop_keeps_lane_loss_speed(controller):
     node, outputs = controller
     node.path_callback(valid_path())
     node.detection_callback(DetectionArray())
@@ -80,7 +80,8 @@ def test_lidar_and_red_light_override_lane_loss_speed(controller):
     node.detection_callback(DetectionArray(detections=[signal]))
     node.traffic_light_callback(String(data='Red'))
     node.timer_callback()
-    assert outputs[-1].left_speed == outputs[-1].right_speed == 0
+    # Red-light stopping is disabled in this real-vehicle snapshot.
+    assert outputs[-1].left_speed == outputs[-1].right_speed == 140
     node.traffic_light_callback(String(data='Green'))
     node.timer_callback()
     assert outputs[-1].left_speed == outputs[-1].right_speed == 140
